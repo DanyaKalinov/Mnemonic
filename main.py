@@ -105,6 +105,13 @@ async def on_startup(bot: Bot):
     )
     print(f"🚀 Бот Второй Мозг запущен, webhook: {webhook_url}", flush=True)
 
+    # Диагностика: сверяем с тем, что Telegram реально видит у себя.
+    # Если тут url пустой — проблема на стороне Telegram/токена, а не в коде.
+    info = await bot.get_webhook_info()
+    print(f"🔍 Telegram видит webhook как: {info.url!r}", flush=True)
+    if info.last_error_message:
+        print(f"⚠️ Последняя ошибка доставки от Telegram: {info.last_error_message}", flush=True)
+
 
 async def on_shutdown(bot: Bot):
     await bot.delete_webhook()
