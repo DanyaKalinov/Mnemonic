@@ -164,13 +164,13 @@ async def get_stats() -> dict:
 
 # ----- Напоминания -----
 async def add_reminder(
-    user_id: int, text: str, notify_at: str, recurrence: Optional[str] = None
+    user_id: int, text: str, notify_at, recurrence: Optional[str] = None
 ) -> int:
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO reminders (user_id, text, notify_at, recurrence)
-            VALUES ($1, $2, $3::timestamptz, $4)
+            VALUES ($1, $2, $3, $4)
             RETURNING id
             """,
             user_id, text, notify_at, recurrence,

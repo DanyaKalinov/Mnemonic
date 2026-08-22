@@ -3,7 +3,7 @@ import os
 import tempfile
 import re
 import dateparser
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from aiogram import Router, types
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -195,7 +195,8 @@ async def cmd_reminders(message: Message):
     lines = []
     for r in active:
         suffix = " 🔁" if r.get('recurrence') else ""
-        lines.append(f"• {r['text']} — {r['notify_at']}{suffix}")
+        when = r['notify_at'].strftime('%d.%m.%Y %H:%M')
+        lines.append(f"• {r['text']} — {when}{suffix}")
     await message.answer("📋 Активные напоминания:\n" + "\n".join(lines))
 
 # ----- Команда /memory (список последних записей + удаление) -----
@@ -303,6 +304,17 @@ async def handle_text(message: Message):
 
 # ----- Обработка напоминаний (внутренняя функция) -----
 async def handle_reminder_command(message: Message):
+    try:
+        await _parse_and_save_reminder(message)
+    except Exception as e:
+        print(f"❌ Ошибка сохранения напоминания: {e}")
+        await message.answer(
+            "😵 Не получилось сохранить напоминание — что-то пошло не так на моей стороне. "
+            "Попробуй ещё раз чуть позже."
+        )
+
+
+async def _parse_and_save_reminder(message: Message):
     text = message.text
     user_id = message.from_user.id
 
@@ -334,13 +346,12 @@ async def handle_reminder_command(message: Message):
         else:
             await message.answer("⏰ Не могу понять единицу времени. Используй: минуты, часы, дни.")
             return
-        remind_at = datetime.now().timestamp() + delta
-        remind_at_str = datetime.fromtimestamp(remind_at).strftime('%Y-%m-%d %H:%M:%S')
+        remind_at = datetime.now(timezone.utc) + timedelta(seconds=delta)
         reminder_text = text[:match.start()].strip()
         if not reminder_text or reminder_text.lower() in ('напомни', 'напомни мне'):
             await message.answer("⚠️ Напиши, что именно напомнить. Например: «Напомни мне позвонить маме через 30 минут».")
             return
-        await add_reminder(user_id, reminder_text, remind_at_str, recurrence)
+        await add_reminder(user_id, reminder_text, remind_at, recurrence)
         suffix = " 🔁 (повторяется)" if recurrence else ""
         await message.answer(f"✅ Напомню **{reminder_text}** {match.group(0)}{suffix}.")
         return
@@ -352,10 +363,17 @@ async def handle_reminder_command(message: Message):
         if not reminder_text or reminder_text.lower() in ('напомни', 'напомни мне'):
             await message.answer("⚠️ Напиши, что именно напомнить.")
             return
-        parsed = dateparser.parse(match_date.group(0), settings={'PREFER_DATES_FROM': 'future'})
+        parsed = dateparser.parse(
+            match_date.group(0),
+            settings={
+                'PREFER_DATES_FROM': 'future',
+                'RETURN_AS_TIMEZONE_AWARE': True,
+                'TIMEZONE': 'UTC',
+                'TO_TIMEZONE': 'UTC',
+            },
+        )
         if parsed:
-            remind_at_str = parsed.strftime('%Y-%m-%d %H:%M:%S')
-            await add_reminder(user_id, reminder_text, remind_at_str, recurrence)
+            await add_reminder(user_id, reminder_text, parsed, recurrence)
             suffix = " 🔁 (повторяется)" if recurrence else ""
             await message.answer(f"✅ Напомню **{reminder_text}** {parsed.strftime('%d.%m.%Y в %H:%M')}{suffix}.")
             return
@@ -364,13 +382,14 @@ async def handle_reminder_command(message: Message):
             return
 
     if recurrence and not match and not match_date:
-        # Повтор указан, но конкретное время — нет: по умолчанию берём "завтра в это же время"
-        remind_at_str = (datetime.now()).strftime('%Y-%m-%d %H:%M:%S')
+        # Повтор указан, но конкретное время — нет: по умолчанию берём "прямо сейчас", 
+        # дальше сработает по recurrence
+        remind_at = datetime.now(timezone.utc)
         reminder_text = text.strip()
         if reminder_text.lower() in ('напомни', 'напомни мне', ''):
             await message.answer("⚠️ Напиши, что именно напомнить.")
             return
-        await add_reminder(user_id, reminder_text, remind_at_str, recurrence)
+        await add_reminder(user_id, reminder_text, remind_at, recurrence)
         await message.answer(f"✅ Буду напоминать **{reminder_text}** 🔁, начиная с сегодня.")
         return
 
