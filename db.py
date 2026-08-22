@@ -26,6 +26,11 @@ async def init_db() -> None:
         min_size=1,
         max_size=5,
         init=_init_connection,
+        # Supabase Transaction pooler работает через PgBouncer в режиме
+        # transaction, где соединения переиспользуются между запросами —
+        # подготовленные выражения (prepared statements) там не работают.
+        # asyncpg использует их по умолчанию, поэтому явно отключаем кэш.
+        statement_cache_size=0,
     )
 
 
