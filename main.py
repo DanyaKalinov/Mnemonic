@@ -103,7 +103,7 @@ async def on_startup(bot: Bot):
         secret_token=WEBHOOK_SECRET,
         drop_pending_updates=True,
     )
-    print(f"🚀 Бот Второй Мозг запущен, webhook: {webhook_url}")
+    print(f"🚀 Бот Второй Мозг запущен, webhook: {webhook_url}", flush=True)
 
 
 async def on_shutdown(bot: Bot):
