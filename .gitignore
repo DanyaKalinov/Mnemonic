@@ -1,0 +1,20 @@
+# Секреты — никогда не коммитить
+.env
+.env.*
+!.env.example
+
+# Скомпилированный Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Виртуальное окружение (если создавал через venv)
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Прочее
+.DS_Store
