@@ -230,6 +230,16 @@ async def get_user_reminders(user_id: int) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+async def delete_reminder(reminder_id: int, user_id: int) -> bool:
+    """Удаляет напоминание, только если оно принадлежит этому же пользователю."""
+    async with get_pool().acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM reminders WHERE id = $1 AND user_id = $2",
+            reminder_id, user_id,
+        )
+    return int(result.split()[-1]) > 0
+
+
 # ----- Память (списки/удаление — сам поиск по смыслу остался в memory.py) -----
 async def get_user_memories(user_id: int, limit: int = 10) -> list[dict]:
     async with get_pool().acquire() as conn:
