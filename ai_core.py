@@ -37,7 +37,7 @@ async def get_ai_response(user_id: int, user_question: str) -> str:
         # остальные пользователи и обработка входящих вебхуков).
         response = await asyncio.to_thread(
             client.models.generate_content,
-            model="gemini-2.5-flash-lite",
+            model="gemini-flash-lite-latest",
             contents=[
                 types.Content(
                     role="user",
@@ -62,7 +62,7 @@ async def describe_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> s
     try:
         response = await asyncio.to_thread(
             client.models.generate_content,
-            model="gemini-2.5-flash-lite",
+            model="gemini-flash-lite-latest",
             contents=[
                 types.Content(
                     role="user",
@@ -93,7 +93,7 @@ async def summarize_for_digest(entries: list[str]) -> str:
     try:
         response = await asyncio.to_thread(
             client.models.generate_content,
-            model="gemini-2.5-flash-lite",
+            model="gemini-flash-lite-latest",
             contents=[prompt],
         )
         return response.text

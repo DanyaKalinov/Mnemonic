@@ -39,7 +39,7 @@ def _classify_tag_sync(text: str) -> str:
     )
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
+            model="gemini-flash-lite-latest",
             contents=[prompt],
         )
         guess = response.text.strip().lower()
