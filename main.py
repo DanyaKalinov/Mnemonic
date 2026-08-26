@@ -16,6 +16,7 @@ from db import (
 )
 from ai_core import summarize_for_digest
 from access_control import ApprovalMiddleware
+from error_handler import register_error_handler
 
 logging.basicConfig(level=logging.INFO)
 
@@ -132,6 +133,7 @@ def main():
     dp = Dispatcher()
     dp.message.middleware(ApprovalMiddleware())
     dp.include_router(router)
+    register_error_handler(dp)
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 

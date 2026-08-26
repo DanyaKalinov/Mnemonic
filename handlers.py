@@ -1,9 +1,6 @@
 import asyncio
 import os
 import tempfile
-import re
-import dateparser
-from datetime import datetime, timedelta, timezone
 from aiogram import Router, types
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -18,6 +15,7 @@ from db import (
     get_user_memories, delete_memory,
     list_users, get_stats,
 )
+from reminder_parser import parse_reminder_text
 from memory import add_memory
 from ai_core import get_ai_response, describe_image
 
@@ -329,107 +327,16 @@ async def handle_reminder_command(message: Message):
 
 
 async def _parse_and_save_reminder(message: Message):
-    text = message.text
-    user_id = message.from_user.id
+    result = parse_reminder_text(message.text)
 
-    # Убираем триггерное слово в начале — "напомни", "напомни мне",
-    # "напомнить", "напоминай", "напоминай мне". Порядок важен: сначала
-    # более длинные варианты, иначе "мне" останется висеть в тексте задачи.
-    trigger_pattern = re.compile(
-        r'^(напомни мне|напомнить|напомни|напоминай мне|напоминай)\s*',
-        re.IGNORECASE,
-    )
-    working_text = trigger_pattern.sub('', text, count=1).strip()
-
-    # Повтор: "каждый день/каждую неделю/каждый месяц/каждый <день недели>".
-    # Ищем в ЛЮБОМ месте фразы (а не только сразу после триггера) —
-    # порядок слов в русском свободный: время может идти и до, и после задачи.
-    recurrence = None
-    recurrence_match = re.search(
-        r'кажд(?:ый|ую|ое)\s+'
-        r'(день|недел[юи]|месяц|понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресень[ея])',
-        working_text, re.IGNORECASE,
-    )
-    if recurrence_match:
-        word = recurrence_match.group(1).lower()
-        if word.startswith('день'):
-            recurrence = 'daily'
-        elif word.startswith('недел'):
-            recurrence = 'weekly'
-        elif word.startswith('месяц'):
-            recurrence = 'monthly'
-        else:
-            # конкретный день недели ("каждый вторник") — считаем еженедельным
-            recurrence = 'weekly'
-        working_text = (working_text[:recurrence_match.start()] + working_text[recurrence_match.end():]).strip()
-
-    # "через N минут/часов/дней" — тоже ищем где угодно в оставшемся тексте
-    remind_at = None
-    delta_match = re.search(
-        r'через\s+(\d+)\s+(минут\w*|час\w*|дн\w*|день)', working_text, re.IGNORECASE,
-    )
-    if delta_match:
-        amount = int(delta_match.group(1))
-        unit = delta_match.group(2).lower()
-        if unit.startswith('минут'):
-            delta = timedelta(minutes=amount)
-        elif unit.startswith('час'):
-            delta = timedelta(hours=amount)
-        else:
-            delta = timedelta(days=amount)
-        remind_at = datetime.now(timezone.utc) + delta
-        working_text = (working_text[:delta_match.start()] + working_text[delta_match.end():]).strip()
-
-    # "завтра"/"сегодня"/"в HH:MM" (и их сочетания) — тоже в любом месте.
-    # Порядок альтернатив важен: сначала сочетание "сегодня в 23:00" целиком,
-    # иначе регулярка захватит только "сегодня" и оставит "в 23:00" в тексте задачи.
-    if remind_at is None:
-        date_pattern = re.compile(
-            r'(?:завтра|сегодня)\s+в\s+\d{1,2}:\d{2}|завтра|сегодня|в\s+\d{1,2}:\d{2}',
-            re.IGNORECASE,
-        )
-        date_match = date_pattern.search(working_text)
-        if date_match:
-            parsed = dateparser.parse(
-                date_match.group(0),
-                settings={
-                    'PREFER_DATES_FROM': 'future',
-                    'RETURN_AS_TIMEZONE_AWARE': True,
-                    'TIMEZONE': 'UTC',
-                    'TO_TIMEZONE': 'UTC',
-                },
-            )
-            if parsed:
-                remind_at = parsed
-            working_text = (working_text[:date_match.start()] + working_text[date_match.end():]).strip()
-
-    reminder_text = working_text.strip(' ,.-')
-
-    if not reminder_text:
-        await message.answer(
-            "⚠️ Напиши, что именно напомнить. Например: «Напомни мне позвонить маме через 30 минут» "
-            "или «Напоминай каждый вторник отложить деньги»."
-        )
+    if not result.ok:
+        await message.answer(result.error)
         return
 
-    if remind_at is None:
-        if recurrence:
-            # Повтор указан, а конкретное время — нет: начинаем прямо сейчас,
-            # дальше сработает по расписанию повтора
-            remind_at = datetime.now(timezone.utc)
-        else:
-            await message.answer(
-                "⏰ Не могу понять, когда напомнить. Попробуй:\n"
-                "• «Напомни мне [текст] через 30 минут»\n"
-                "• «Напомни [текст] завтра в 15:00»\n"
-                "• «Напоминай каждый день [текст] в 9:00»"
-            )
-            return
-
-    await add_reminder(user_id, reminder_text, remind_at, recurrence)
-    when_label = remind_at.strftime('%d.%m.%Y %H:%M')
-    suffix = " 🔁 (повторяется)" if recurrence else ""
-    await message.answer(f"✅ Напомню **{reminder_text}** {when_label}{suffix}.")
+    await add_reminder(message.from_user.id, result.reminder_text, result.remind_at, result.recurrence)
+    when_label = result.remind_at.strftime('%d.%m.%Y %H:%M')
+    suffix = " 🔁 (повторяется)" if result.recurrence else ""
+    await message.answer(f"✅ Напомню **{result.reminder_text}** {when_label}{suffix}.")
 
 # ----- Обработка PDF -----
 @router.message(lambda msg: msg.document and msg.document.mime_type == "application/pdf")
