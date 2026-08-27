@@ -7,6 +7,7 @@
 """
 import unittest
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from reminder_parser import parse_reminder_text, NO_TEXT_ERROR, NO_TIME_ERROR
 
@@ -84,6 +85,26 @@ class TestReminderParser(unittest.TestCase):
         self.assertEqual(result.remind_at.day, (NOW + timedelta(days=1)).day)
         self.assertEqual(result.remind_at.hour, 10)
         self.assertEqual(result.remind_at.minute, 30)
+
+    # --- Явная календарная дата: "30 сентября" (регрессия со скриншота) ---
+    def test_explicit_month_date_regression(self):
+        result = parse_reminder_text("Напомни 30 сентября что скоро на учебу", now=NOW)
+        self.assertTrue(result.ok, msg=result.error)
+        self.assertEqual(result.reminder_text, "что скоро на учебу")
+        self.assertEqual(result.remind_at.month, 9)
+        self.assertEqual(result.remind_at.day, 30)
+
+    # --- Часовой пояс: "сегодня в 23:00" по Стамбулу должно сработать
+    # именно в 23:00 по Стамбулу, а не по UTC (регрессия со скриншота) ---
+    def test_timezone_conversion_regression(self):
+        result = parse_reminder_text(
+            "Напомни сегодня в 23:00 заказать вб", tz_name="Europe/Istanbul", now=NOW
+        )
+        self.assertTrue(result.ok, msg=result.error)
+        local_time = result.remind_at.astimezone(ZoneInfo("Europe/Istanbul"))
+        self.assertEqual(local_time.hour, 23)
+        # Стамбул — UTC+3, значит в UTC должно быть на 3 часа меньше
+        self.assertEqual(result.remind_at.hour, 20)
 
 
 if __name__ == "__main__":

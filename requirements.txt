@@ -7,3 +7,5 @@ PyPDF2
 google-genai
 requests
 dateparser
+timezonefinder
+timezonefinder

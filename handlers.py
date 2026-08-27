@@ -1,16 +1,21 @@
 import asyncio
 import os
 import tempfile
+from zoneinfo import ZoneInfo
 from aiogram import Router, types
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+)
 import PyPDF2
 import requests
 from dotenv import load_dotenv
+from timezonefinder import TimezoneFinder
 
 from config import ADMIN_ID
 from db import (
-    add_user, user_exists, get_user, set_user_status,
+    add_user, user_exists, get_user, set_user_status, update_user_settings,
     add_reminder, get_user_reminders, snooze_reminder, delete_reminder,
     get_user_memories, delete_memory,
     list_users, get_stats,
@@ -20,6 +25,9 @@ from memory import add_memory
 from ai_core import get_ai_response, describe_image
 
 load_dotenv()
+# TimezoneFinder держит в памяти геоданные — создаём один раз на процесс,
+# а не при каждом сообщении с локацией.
+_tz_finder = TimezoneFinder()
 router = Router()
 
 # ----- Вспомогательная функция для распознавания голоса (Yandex SpeechKit) -----
@@ -100,6 +108,8 @@ async def cmd_start(message: Message):
         "🖼 **Отправь фото** — я опишу его и распознаю текст, если есть.\n\n"
         "⏰ **Напоминания**: напиши «Напомни мне [текст] через 30 минут»\n"
         "🔁 Можно и повторяющиеся: «Напомни каждый день пить витамины в 9:00»\n\n"
+        "🌍 **Сначала настрой часовой пояс** — отправь /timezone, иначе "
+        "напоминания будут приходить по UTC, а не по твоему местному времени.\n\n"
         "Для списка всех команд отправь /help"
     )
     await message.answer(welcome_text)
@@ -150,6 +160,43 @@ async def handle_reminder_snooze(callback: CallbackQuery):
     await callback.message.edit_text(callback.message.text + "\n\n⏰ Отложено на час")
     await callback.answer()
 
+# ----- Команда /timezone (определение часового пояса по геолокации) -----
+@router.message(Command("timezone"))
+async def cmd_timezone(message: Message):
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📍 Поделиться локацией", request_location=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await message.answer(
+        "Нажми на кнопку ниже, чтобы поделиться геопозицией — я определю твой часовой "
+        "пояс и буду присылать напоминания по твоему местному времени, а не по UTC.",
+        reply_markup=keyboard,
+    )
+
+# ----- Обработка геолокации -----
+@router.message(lambda msg: msg.location is not None)
+async def handle_location(message: Message):
+    tz_name = _tz_finder.timezone_at(
+        lat=message.location.latitude, lng=message.location.longitude
+    )
+    if not tz_name:
+        await message.answer(
+            "😕 Не смог определить часовой пояс по этой точке. Попробуй ещё раз через /timezone.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    user = await get_user(message.from_user.id)
+    settings = (user["settings"] if user else {}) or {}
+    settings["timezone"] = tz_name
+    await update_user_settings(message.from_user.id, settings)
+
+    await message.answer(
+        f"✅ Часовой пояс определён: {tz_name}. Теперь напоминания будут приходить по этому времени.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
 # ----- Команда /help -----
 @router.message(Command("help"))
 async def cmd_help(message: Message):
@@ -158,6 +205,7 @@ async def cmd_help(message: Message):
         "📝 /start — Показать приветствие\n"
         "❓ /help — Показать справку\n"
         "📋 /reminders — Список активных напоминаний (можно отменять)\n"
+        "🌍 /timezone — Настроить часовой пояс по геолокации\n"
         "🗂 /memory — Последние записи в памяти (можно удалять)\n\n"
         "🧠 **Просто напиши текст** — я запомню его\n"
         "🔎 **Задай вопрос** — я найду ответ среди твоих записей\n"
@@ -185,6 +233,9 @@ async def cmd_help(message: Message):
 @router.message(Command("reminders"))
 async def cmd_reminders(message: Message):
     user_id = message.from_user.id
+    user = await get_user(user_id)
+    tz_name = ((user["settings"] if user else {}) or {}).get("timezone") or "UTC"
+
     reminders = await get_user_reminders(user_id)
     active = [r for r in reminders if not r['is_sent']]
     if not active:
@@ -193,7 +244,8 @@ async def cmd_reminders(message: Message):
     await message.answer("📋 Активные напоминания:")
     for r in active:
         suffix = " 🔁" if r.get('recurrence') else ""
-        when = r['notify_at'].strftime('%d.%m.%Y %H:%M')
+        local_time = r['notify_at'].astimezone(ZoneInfo(tz_name))
+        when = local_time.strftime('%d.%m.%Y %H:%M')
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="🗑 Отменить", callback_data=f"delrem:{r['id']}"),
         ]])
@@ -327,16 +379,21 @@ async def handle_reminder_command(message: Message):
 
 
 async def _parse_and_save_reminder(message: Message):
-    result = parse_reminder_text(message.text)
+    user = await get_user(message.from_user.id)
+    tz_name = ((user["settings"] if user else {}) or {}).get("timezone") or "UTC"
+
+    result = parse_reminder_text(message.text, tz_name=tz_name)
 
     if not result.ok:
         await message.answer(result.error)
         return
 
     await add_reminder(message.from_user.id, result.reminder_text, result.remind_at, result.recurrence)
-    when_label = result.remind_at.strftime('%d.%m.%Y %H:%M')
+    local_time = result.remind_at.astimezone(ZoneInfo(tz_name))
+    when_label = local_time.strftime('%d.%m.%Y %H:%M')
     suffix = " 🔁 (повторяется)" if result.recurrence else ""
-    await message.answer(f"✅ Напомню **{result.reminder_text}** {when_label}{suffix}.")
+    tz_note = "" if tz_name != "UTC" else " (UTC — часовой пояс не настроен, отправь /timezone)"
+    await message.answer(f"✅ Напомню **{result.reminder_text}** {when_label}{suffix}{tz_note}.")
 
 # ----- Обработка PDF -----
 @router.message(lambda msg: msg.document and msg.document.mime_type == "application/pdf")
