@@ -426,8 +426,8 @@ async def handle_voice(message: Message):
     recognized_text = await transcribe_voice(tmp_path)
     os.unlink(tmp_path)
 
-    if "Не удалось" in recognized_text or "Не смог" in recognized_text:
-        await message.answer(f"⚠️ {recognized_text}")
+    if recognized_text.startswith("⚠️") or recognized_text.startswith("😵"):
+        await message.answer(recognized_text)
         return
 
     memory_text = f"[Голосовое]\n{recognized_text}"
