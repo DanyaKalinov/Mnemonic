@@ -3,11 +3,15 @@ import os
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from groq import Groq
 from memory import search_memory
 
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 client = genai.Client(api_key=GOOGLE_API_KEY)
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 async def get_ai_response(user_id: int, user_question: str) -> str:
     if not GOOGLE_API_KEY:
@@ -100,3 +104,29 @@ async def summarize_for_digest(entries: list[str]) -> str:
     except Exception as e:
         print(f"❌ Ошибка составления дайджеста: {e}")
         return ""
+
+
+async def transcribe_voice(file_path: str) -> str:
+    """Распознаёт голосовое сообщение через Groq (Whisper Large v3 Turbo).
+
+    Groq SDK синхронный — сам сетевой вызов уводим в отдельный поток,
+    как и остальные блокирующие вызовы в этом файле.
+    """
+    if not groq_client:
+        return "⚠️ Не настроен ключ Groq (GROQ_API_KEY)."
+
+    def _sync_transcribe() -> str:
+        with open(file_path, "rb") as f:
+            result = groq_client.audio.transcriptions.create(
+                file=f,
+                model="whisper-large-v3-turbo",
+                language="ru",
+            )
+        return result.text
+
+    try:
+        text = await asyncio.to_thread(_sync_transcribe)
+        return text.strip() or "Не удалось распознать речь."
+    except Exception as e:
+        print(f"❌ Ошибка Groq (распознавание голоса): {e}")
+        return "😵 Не смог разобрать голосовое."

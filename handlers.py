@@ -9,7 +9,6 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
 )
 import PyPDF2
-import requests
 from dotenv import load_dotenv
 from timezonefinder import TimezoneFinder
 
@@ -22,34 +21,13 @@ from db import (
 )
 from reminder_parser import parse_reminder_text
 from memory import add_memory
-from ai_core import get_ai_response, describe_image
+from ai_core import get_ai_response, describe_image, transcribe_voice
 
 load_dotenv()
 # TimezoneFinder держит в памяти геоданные — создаём один раз на процесс,
 # а не при каждом сообщении с локацией.
 _tz_finder = TimezoneFinder()
 router = Router()
-
-# ----- Вспомогательная функция для распознавания голоса (Yandex SpeechKit) -----
-async def recognize_speech(file_path: str) -> str:
-    api_key = os.getenv("YANDEX_SPEECHKIT_KEY")
-    if not api_key:
-        return "⚠️ Не настроен ключ SpeechKit."
-    url = "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize"
-    headers = {"Authorization": f"Api-Key {api_key}"}
-    with open(file_path, "rb") as f:
-        audio_data = f.read()
-    params = {"lang": "ru-RU", "format": "oggopus"}
-    try:
-        response = await asyncio.to_thread(
-            requests.post, url, headers=headers, params=params, data=audio_data
-        )
-        response.raise_for_status()
-        result = response.json()
-        return result.get("result", "Не удалось распознать речь.")
-    except Exception as e:
-        print(f"Ошибка SpeechKit: {e}")
-        return "😵 Не смог разобрать голосовое."
 
 # ----- Уведомление админа о новой/повторной заявке -----
 async def notify_admin_new_request(bot, user_id: int, tg_user: types.User) -> None:
@@ -445,7 +423,7 @@ async def handle_voice(message: Message):
         tmp_path = tmp.name
 
     await message.answer("🎤 Распознаю голосовое...")
-    recognized_text = await recognize_speech(tmp_path)
+    recognized_text = await transcribe_voice(tmp_path)
     os.unlink(tmp_path)
 
     if "Не удалось" in recognized_text or "Не смог" in recognized_text:

@@ -8,4 +8,4 @@ google-genai
 requests
 dateparser
 timezonefinder
-timezonefinder
+groq

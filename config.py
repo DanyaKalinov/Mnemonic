@@ -5,7 +5,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-YANDEX_SPEECHKIT_KEY = os.getenv("YANDEX_SPEECHKIT_KEY")  # опционально
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # для распознавания голосовых (Whisper через Groq)
 
 # Telegram ID администратора — именно ему будут приходить заявки на доступ
 # (узнать свой ID можно, например, у бота @userinfobot)
@@ -19,5 +19,5 @@ if not BOT_TOKEN:
 if not GOOGLE_API_KEY:
     raise ValueError("❌ GOOGLE_API_KEY не найден в .env")
 
-if not YANDEX_SPEECHKIT_KEY:
-    print("⚠️ Предупреждение: YANDEX_SPEECHKIT_KEY не задан — голосовые не будут работать.")
+if not GROQ_API_KEY:
+    print("⚠️ Предупреждение: GROQ_API_KEY не задан — голосовые не будут работать.")
