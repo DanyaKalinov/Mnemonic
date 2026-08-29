@@ -18,16 +18,30 @@ from db import (
     add_reminder, get_user_reminders, snooze_reminder, delete_reminder,
     get_user_memories, delete_memory,
     list_users, get_stats,
+    set_user_role, is_owner, add_eva_command,
+    can_use_eva, set_eva_access, list_owner_ids, list_eva_access_users,
 )
 from reminder_parser import parse_reminder_text
 from memory import add_memory
 from ai_core import get_ai_response, describe_image, transcribe_voice
+from eva_ws import is_agent_connected, push_command_to_agents
 
 load_dotenv()
 # TimezoneFinder держит в памяти геоданные — создаём один раз на процесс,
 # а не при каждом сообщении с локацией.
 _tz_finder = TimezoneFinder()
 router = Router()
+
+# ----- Текст с текущим уровнем доступа (боту / полным функциям Евы) -----
+def _eva_access_line(user: dict) -> str:
+    if user["role"] == "owner":
+        return "🤖 Доступ к полным функциям (Ева): ✅ есть (владелец)"
+    if user["eva_access"] == "granted":
+        return "🤖 Доступ к полным функциям (Ева): ✅ есть"
+    if user["eva_access"] == "pending":
+        return "🤖 Доступ к полным функциям (Ева): ⏳ заявка на рассмотрении"
+    return "🤖 Доступ к полным функциям (Ева): ❌ нет — запросить: /eva_request"
+
 
 # ----- Уведомление админа о новой/повторной заявке -----
 async def notify_admin_new_request(bot, user_id: int, tg_user: types.User) -> None:
@@ -73,11 +87,14 @@ async def cmd_start(message: Message):
             return
     else:
         if not await user_exists(user_id):
-            await add_user(user_id, status="approved")
+            await add_user(user_id, status="approved", role="owner")
+
+    user = await get_user(user_id)
+    access_line = _eva_access_line(user)
 
     welcome_text = (
         f"🧠 Привет, {username}!\n\n"
-        "Я — твой **Второй Мозг**. Я запоминаю всё, что ты мне пишешь,\n"
+        "Я — твой **Второй Мозг**, часть экосистемы **Евы**. Я запоминаю всё, что ты мне пишешь,\n"
         "и могу найти это по смыслу даже через месяцы.\n\n"
         "📌 **Просто напиши мне что угодно** — я сохраню это в память.\n"
         "🔍 **Спроси меня о чём‑то** — я найду ответ среди твоих записей.\n"
@@ -88,7 +105,8 @@ async def cmd_start(message: Message):
         "🔁 Можно и повторяющиеся: «Напомни каждый день пить витамины в 9:00»\n\n"
         "🌍 **Сначала настрой часовой пояс** — отправь /timezone, иначе "
         "напоминания будут приходить по UTC, а не по твоему местному времени.\n\n"
-        "Для списка всех команд отправь /help"
+        f"{access_line}\n\n"
+        "Для списка всех команд отправь /help, для проверки статуса — /status"
     )
     await message.answer(welcome_text)
 
@@ -182,6 +200,7 @@ async def cmd_help(message: Message):
         "🤖 **Что я умею:**\n\n"
         "📝 /start — Показать приветствие\n"
         "❓ /help — Показать справку\n"
+        "📊 /status — Проверить уровень доступа (бот / Ева)\n"
         "📋 /reminders — Список активных напоминаний (можно отменять)\n"
         "🌍 /timezone — Настроить часовой пояс по геолокации\n"
         "🗂 /memory — Последние записи в памяти (можно удалять)\n\n"
@@ -205,7 +224,44 @@ async def cmd_help(message: Message):
             "🚫 /revoke <id> — Отозвать доступ у пользователя\n"
             "📊 /stats — Статистика бота"
         )
+    if await is_owner(message.from_user.id):
+        help_text += (
+            "\n\n🤖 **Команды Евы (владелец):**\n"
+            "🎛 /eva <команда> — Отдать команду desktop-агенту\n"
+            "📡 /agent_status — Подключён ли desktop-агент\n"
+            "👥 /eva_users — Кто имеет доступ к Еве\n"
+            "🚫 /eva_revoke <id> — Отозвать доступ к Еве"
+        )
+    elif await can_use_eva(message.from_user.id):
+        help_text += (
+            "\n\n🤖 **Ева (доступ выдан):**\n"
+            "🎛 /eva <команда> — Отдать команду desktop-агенту\n"
+            "📡 /agent_status — Подключён ли desktop-агент"
+        )
+    else:
+        help_text += (
+            "\n\n🤖 **Ева** — голосовой ИИ-помощник с доступом к ПК.\n"
+            "🙋 /eva_request — Запросить доступ у владельца"
+        )
     await message.answer(help_text)
+
+# ----- Команда /status — уровень доступа пользователя -----
+@router.message(Command("status"))
+async def cmd_status(message: Message):
+    user = await get_user(message.from_user.id)
+    if user is None:
+        await message.answer("Похоже, ты ещё не зарегистрирован. Отправь /start.")
+        return
+
+    bot_access_map = {
+        "approved": "✅ одобрен",
+        "pending": "⏳ заявка на рассмотрении",
+        "rejected": "❌ отклонён — можно подать заявку снова через /start",
+    }
+    bot_access_line = f"📋 Доступ к боту: {bot_access_map.get(user['status'], user['status'])}"
+    access_line = _eva_access_line(user)
+
+    await message.answer(f"{bot_access_line}\n{access_line}")
 
 # ----- Команда /reminders (список активных напоминаний + удаление) -----
 @router.message(Command("reminders"))
@@ -322,6 +378,141 @@ async def cmd_stats(message: Message):
         f"⏰ Активных напоминаний: {stats['active_reminders']}"
     )
     await message.answer(text)
+
+# ----- Ева: запрос доступа обычным пользователем -----
+@router.message(Command("eva_request"))
+async def cmd_eva_request(message: Message):
+    user_id = message.from_user.id
+    user = await get_user(user_id)
+    if user is None:
+        return  # мидлварь и так не пропустит неодобренного, но на всякий случай
+    if user["role"] == "owner" or user["eva_access"] == "granted":
+        await message.answer("✅ У тебя уже есть доступ к Еве — просто используй /eva <команда>.")
+        return
+    if user["eva_access"] == "pending":
+        await message.answer("⏳ Заявка уже отправлена, жди решения владельца.")
+        return
+
+    await set_eva_access(user_id, "pending")
+    username = message.from_user.username or message.from_user.full_name
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Разрешить", callback_data=f"eva_grant:{user_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"eva_deny:{user_id}"),
+    ]])
+    owner_ids = await list_owner_ids()
+    for owner_id in owner_ids:
+        try:
+            await message.bot.send_message(
+                owner_id,
+                f"🤖 Запрос доступа к Еве:\n@{username} (ID: {user_id})",
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            print(f"⚠️ Не удалось уведомить владельца {owner_id} о запросе Евы: {e}")
+
+    await message.answer("📨 Заявка отправлена владельцу, жди решения.")
+
+# ----- Ева: владелец разрешает/отклоняет запрос -----
+@router.callback_query(lambda c: c.data and (c.data.startswith("eva_grant:") or c.data.startswith("eva_deny:")))
+async def handle_eva_access_decision(callback: CallbackQuery):
+    if not await is_owner(callback.from_user.id):
+        await callback.answer("Только владелец может решать это.", show_alert=True)
+        return
+
+    action, user_id_str = callback.data.split(":")
+    target_id = int(user_id_str)
+
+    if action == "eva_grant":
+        await set_eva_access(target_id, "granted")
+        await callback.message.edit_text(callback.message.text + "\n\n✅ Доступ разрешён.")
+        try:
+            await callback.bot.send_message(target_id, "✅ Тебе разрешили доступ к Еве. Используй /eva <команда>.")
+        except Exception:
+            pass
+    else:
+        await set_eva_access(target_id, "none")
+        await callback.message.edit_text(callback.message.text + "\n\n❌ Доступ отклонён.")
+        try:
+            await callback.bot.send_message(target_id, "❌ Доступ к Еве отклонён.")
+        except Exception:
+            pass
+    await callback.answer()
+
+# ----- Ева: владелец отзывает ранее выданный доступ -----
+@router.message(Command("eva_revoke"))
+async def cmd_eva_revoke(message: Message):
+    if not await is_owner(message.from_user.id):
+        await message.answer("⛔ Отзывать доступ к Еве может только владелец.")
+        return
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: /eva_revoke <user_id>\nСписок ID — /eva_users")
+        return
+    target_id = int(parts[1])
+    await set_eva_access(target_id, "none")
+    await message.answer(f"🚫 Доступ к Еве отозван у пользователя {target_id}.")
+    try:
+        await message.bot.send_message(target_id, "🚫 Твой доступ к Еве отозван владельцем.")
+    except Exception:
+        pass
+
+# ----- Ева: владелец смотрит, у кого есть доступ -----
+@router.message(Command("eva_users"))
+async def cmd_eva_users(message: Message):
+    if not await is_owner(message.from_user.id):
+        await message.answer("⛔ Эта команда доступна только владельцам.")
+        return
+    users = await list_eva_access_users()
+    if not users:
+        await message.answer("Пока никто, кроме владельца, не запрашивал доступ к Еве.")
+        return
+    lines = ["🤖 **Доступ к Еве:**\n"]
+    icons = {"owner": "👑", "granted": "✅", "pending": "⏳"}
+    for u in users:
+        label = "owner" if u["role"] == "owner" else u["eva_access"]
+        lines.append(f"{icons.get(label, '•')} {u['user_id']} — {label}")
+    await message.answer("\n".join(lines))
+
+# ----- Ева: /agent_status — подключён ли desktop-агент -----
+@router.message(Command("agent_status"))
+async def cmd_agent_status(message: Message):
+    if not await can_use_eva(message.from_user.id):
+        await message.answer("⛔ У тебя нет доступа к Еве. Запросить: /eva_request")
+        return
+    if is_agent_connected():
+        await message.answer("🟢 Desktop-агент Евы на связи.")
+    else:
+        await message.answer(
+            "🔴 Desktop-агент не подключён. Команда сохранится в очередь "
+            "и выполнится, как только агент подключится."
+        )
+
+# ----- Ева: /eva <команда> — поставить задачу desktop-агенту -----
+@router.message(Command("eva"))
+async def cmd_eva(message: Message):
+    if not await can_use_eva(message.from_user.id):
+        await message.answer("⛔ У тебя нет доступа к Еве. Запросить: /eva_request")
+        return
+
+    command_text = message.text.partition(" ")[2].strip()
+    if not command_text:
+        await message.answer(
+            "Использование: /eva <команда>\n"
+            "Например: /eva открой блокнот"
+        )
+        return
+
+    command_id = await add_eva_command(message.from_user.id, command_text)
+    sent = await push_command_to_agents(command_id, command_text)
+
+    if sent:
+        await message.answer(f"📤 Команда «{command_text}» отправлена Еве, жду результат...")
+    else:
+        await message.answer(
+            f"📥 Команда «{command_text}» сохранена в очередь — "
+            "desktop-агент сейчас не на связи, выполнится при подключении."
+        )
 
 # ----- Обработка текста (запоминание + AI-ответ) -----
 @router.message(lambda msg: msg.text is not None)

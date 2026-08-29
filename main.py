@@ -17,6 +17,7 @@ from db import (
 from ai_core import summarize_for_digest
 from access_control import ApprovalMiddleware
 from error_handler import register_error_handler
+from eva_ws import eva_ws_handler
 
 logging.basicConfig(level=logging.INFO)
 
@@ -150,7 +151,9 @@ def main():
     dp.startup.register(start_reminders)
 
     app = web.Application()
+    app["bot"] = bot  # нужен внутри eva_ws.py, чтобы слать уведомления владельцу
     app.router.add_get("/health", health)
+    app.router.add_get("/ws/eva", eva_ws_handler)
     SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
