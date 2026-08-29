@@ -65,22 +65,24 @@ def _deserialize_settings(raw: Any) -> dict:
 
 
 # ----- Пользователи -----
-async def add_user(user_id: int, settings: Optional[dict] = None, status: str = "pending") -> None:
+async def add_user(
+    user_id: int, settings: Optional[dict] = None, status: str = "pending", role: str = "user"
+) -> None:
     async with get_pool().acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO users (user_id, settings, status)
-            VALUES ($1, $2::jsonb, $3)
+            INSERT INTO users (user_id, settings, status, role)
+            VALUES ($1, $2::jsonb, $3, $4)
             ON CONFLICT (user_id) DO NOTHING
             """,
-            user_id, _serialize_settings(settings), status,
+            user_id, _serialize_settings(settings), status, role,
         )
 
 
 async def get_user(user_id: int) -> Optional[dict]:
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT user_id, settings, status, created_at FROM users WHERE user_id = $1",
+            "SELECT user_id, settings, status, role, eva_access, created_at FROM users WHERE user_id = $1",
             user_id,
         )
     if row is None:
@@ -89,8 +91,61 @@ async def get_user(user_id: int) -> Optional[dict]:
         "user_id": row["user_id"],
         "settings": _deserialize_settings(row["settings"]),
         "status": row["status"],
+        "role": row["role"],
+        "eva_access": row["eva_access"],
         "created_at": row["created_at"],
     }
+
+
+async def set_user_role(user_id: int, role: str) -> bool:
+    """role: 'user' или 'owner'. Владельцы могут отдавать команды Еве."""
+    async with get_pool().acquire() as conn:
+        result = await conn.execute(
+            "UPDATE users SET role = $2 WHERE user_id = $1", user_id, role,
+        )
+    return int(result.split()[-1]) > 0
+
+
+async def is_owner(user_id: int) -> bool:
+    user = await get_user(user_id)
+    return user is not None and user["role"] == "owner"
+
+
+async def can_use_eva(user_id: int) -> bool:
+    """Владелец — всегда может. Обычный пользователь — только если доступ выдан явно."""
+    user = await get_user(user_id)
+    if user is None:
+        return False
+    return user["role"] == "owner" or user["eva_access"] == "granted"
+
+
+async def set_eva_access(user_id: int, access: str) -> bool:
+    """access: 'none' | 'pending' | 'granted'."""
+    async with get_pool().acquire() as conn:
+        result = await conn.execute(
+            "UPDATE users SET eva_access = $2 WHERE user_id = $1", user_id, access,
+        )
+    return int(result.split()[-1]) > 0
+
+
+async def list_owner_ids() -> list[int]:
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM users WHERE role = 'owner'")
+    return [row["user_id"] for row in rows]
+
+
+async def list_eva_access_users() -> list[dict]:
+    """Для просмотра владельцем — кто имеет/запросил доступ к Еве."""
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT user_id, role, eva_access
+            FROM users
+            WHERE role = 'owner' OR eva_access IN ('pending', 'granted')
+            ORDER BY eva_access DESC, created_at
+            """
+        )
+    return [dict(row) for row in rows]
 
 
 async def set_user_status(user_id: int, status: str) -> None:
@@ -279,3 +334,54 @@ async def get_recent_memories(user_id: int, hours: int = 24) -> list[dict]:
             user_id,
         )
     return [dict(row) for row in rows]
+
+
+# ----- Команды для desktop-агента Евы -----
+async def add_eva_command(requested_by: int, command_text: str) -> int:
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO eva_commands (requested_by, command_text)
+            VALUES ($1, $2)
+            RETURNING id
+            """,
+            requested_by, command_text,
+        )
+    return row["id"]
+
+
+async def get_pending_eva_commands() -> list[dict]:
+    """Команды, которые ещё не были отправлены ни одному агенту."""
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, requested_by, command_text
+            FROM eva_commands
+            WHERE status = 'pending'
+            ORDER BY created_at
+            """
+        )
+    return [dict(row) for row in rows]
+
+
+async def get_eva_command(command_id: int) -> Optional[dict]:
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, requested_by, command_text, status, result_text FROM eva_commands WHERE id = $1",
+            command_id,
+        )
+    return dict(row) if row else None
+
+
+async def update_eva_command_status(
+    command_id: int, status: str, result_text: Optional[str] = None
+) -> None:
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE eva_commands
+            SET status = $2, result_text = $3, updated_at = now()
+            WHERE id = $1
+            """,
+            command_id, status, result_text,
+        )
