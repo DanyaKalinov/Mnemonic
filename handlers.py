@@ -25,6 +25,7 @@ from reminder_parser import parse_reminder_text
 from memory import add_memory
 from ai_core import get_ai_response, describe_image, transcribe_voice
 from eva_ws import is_agent_connected, push_command_to_agents
+from bot_commands import sync_commands_for_user
 
 load_dotenv()
 # TimezoneFinder держит в памяти геоданные — создаём один раз на процесс,
@@ -91,6 +92,7 @@ async def cmd_start(message: Message):
 
     user = await get_user(user_id)
     access_line = _eva_access_line(user)
+    await sync_commands_for_user(message.bot, user_id, user)
 
     welcome_text = (
         f"🧠 Привет, {username}!\n\n"
@@ -123,6 +125,8 @@ async def handle_approval_decision(callback: CallbackQuery):
     if action == "approve":
         await set_user_status(target_user_id, "approved")
         await callback.message.edit_text(callback.message.text + "\n\n✅ Одобрено")
+        updated_user = await get_user(target_user_id)
+        await sync_commands_for_user(callback.bot, target_user_id, updated_user)
         try:
             await callback.bot.send_message(
                 target_user_id,
@@ -426,6 +430,8 @@ async def handle_eva_access_decision(callback: CallbackQuery):
     if action == "eva_grant":
         await set_eva_access(target_id, "granted")
         await callback.message.edit_text(callback.message.text + "\n\n✅ Доступ разрешён.")
+        updated_user = await get_user(target_id)
+        await sync_commands_for_user(callback.bot, target_id, updated_user)
         try:
             await callback.bot.send_message(target_id, "✅ Тебе разрешили доступ к Еве. Используй /eva <команда>.")
         except Exception:
@@ -451,6 +457,8 @@ async def cmd_eva_revoke(message: Message):
         return
     target_id = int(parts[1])
     await set_eva_access(target_id, "none")
+    updated_user = await get_user(target_id)
+    await sync_commands_for_user(message.bot, target_id, updated_user)
     await message.answer(f"🚫 Доступ к Еве отозван у пользователя {target_id}.")
     try:
         await message.bot.send_message(target_id, "🚫 Твой доступ к Еве отозван владельцем.")

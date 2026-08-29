@@ -7,17 +7,19 @@ from aiogram import Bot, Dispatcher
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
-from config import BOT_TOKEN
+from config import BOT_TOKEN, ADMIN_ID
 from handlers import router
 from db import (
     init_db, close_db,
     get_due_reminders, mark_reminder_sent, reschedule_reminder,
     list_approved_users, get_recent_memories, set_last_digest_at,
+    get_user,
 )
 from ai_core import summarize_for_digest
 from access_control import ApprovalMiddleware
 from error_handler import register_error_handler
 from eva_ws import eva_ws_handler
+from bot_commands import set_default_commands, sync_commands_for_user
 
 logging.basicConfig(level=logging.INFO)
 
@@ -113,6 +115,16 @@ async def on_startup(bot: Bot):
     print(f"🔍 Telegram видит webhook как: {info.url!r}", flush=True)
     if info.last_error_message:
         print(f"⚠️ Последняя ошибка доставки от Telegram: {info.last_error_message}", flush=True)
+
+
+    # Меню команд Telegram (кнопка рядом со строкой ввода).
+    # Дефолтное — минимальное, для всех незнакомых/неодобренных чатов.
+    # Плюс сразу выставляем полное меню для ADMIN_ID — он же owner с бутстрапа.
+    # Для остальных пользователей персональное меню выставляется в момент
+    # их /start и при выдаче/отзыве доступа к Еве (см. handlers.py).
+    await set_default_commands(bot)
+    admin_user = await get_user(ADMIN_ID)
+    await sync_commands_for_user(bot, ADMIN_ID, admin_user)
 
 
 async def on_shutdown(bot: Bot):
