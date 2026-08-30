@@ -337,25 +337,29 @@ async def get_recent_memories(user_id: int, hours: int = 24) -> list[dict]:
 
 
 # ----- Команды для desktop-агента Евы -----
-async def add_eva_command(requested_by: int, command_text: str) -> int:
+async def add_eva_command(
+    requested_by: int, command_text: str, action_json: Optional[str] = None, status: str = "pending"
+) -> int:
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO eva_commands (requested_by, command_text)
-            VALUES ($1, $2)
+            INSERT INTO eva_commands (requested_by, command_text, action_json, status)
+            VALUES ($1, $2, $3, $4)
             RETURNING id
             """,
-            requested_by, command_text,
+            requested_by, command_text, action_json, status,
         )
     return row["id"]
 
 
 async def get_pending_eva_commands() -> list[dict]:
-    """Команды, которые ещё не были отправлены ни одному агенту."""
+    """Команды, которые ещё не были отправлены ни одному агенту.
+    Команды в статусе 'awaiting_confirmation' сюда не попадают —
+    они ждут решения владельца в Telegram, а не подключения агента."""
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, requested_by, command_text
+            SELECT id, requested_by, command_text, action_json
             FROM eva_commands
             WHERE status = 'pending'
             ORDER BY created_at
@@ -367,7 +371,10 @@ async def get_pending_eva_commands() -> list[dict]:
 async def get_eva_command(command_id: int) -> Optional[dict]:
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id, requested_by, command_text, status, result_text FROM eva_commands WHERE id = $1",
+            """
+            SELECT id, requested_by, command_text, action_json, status, result_text
+            FROM eva_commands WHERE id = $1
+            """,
             command_id,
         )
     return dict(row) if row else None

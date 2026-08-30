@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import tempfile
 from zoneinfo import ZoneInfo
@@ -18,10 +19,11 @@ from db import (
     add_reminder, get_user_reminders, snooze_reminder, delete_reminder,
     get_user_memories, delete_memory,
     list_users, get_stats,
-    set_user_role, is_owner, add_eva_command,
+    set_user_role, is_owner, add_eva_command, get_eva_command, update_eva_command_status,
     can_use_eva, set_eva_access, list_owner_ids, list_eva_access_users,
 )
 from reminder_parser import parse_reminder_text
+from eva_command_parser import parse_eva_command
 from memory import add_memory
 from ai_core import get_ai_response, describe_image, transcribe_voice
 from eva_ws import is_agent_connected, push_command_to_agents
@@ -507,12 +509,39 @@ async def cmd_eva(message: Message):
     if not command_text:
         await message.answer(
             "Использование: /eva <команда>\n"
-            "Например: /eva открой блокнот"
+            "Например:\n"
+            "• /eva открой блокнот\n"
+            "• /eva создай файл notes.txt с текстом купить молоко\n"
+            "• /eva прочитай файл notes.txt\n"
+            "• /eva удали файл notes.txt"
         )
         return
 
-    command_id = await add_eva_command(message.from_user.id, command_text)
-    sent = await push_command_to_agents(command_id, command_text)
+    parsed = parse_eva_command(command_text)
+    if not parsed.ok:
+        await message.answer(parsed.error)
+        return
+
+    action_json = json.dumps({"action": parsed.action, "params": parsed.params})
+
+    if parsed.requires_confirmation:
+        # Файловые операции (создание/удаление) не уходят агенту сразу —
+        # сначала спрашиваем подтверждение владельца прямо здесь, в Telegram.
+        command_id = await add_eva_command(
+            message.from_user.id, command_text, action_json=action_json, status="awaiting_confirmation",
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"eva_confirm:{command_id}"),
+            InlineKeyboardButton(text="❌ Отменить", callback_data=f"eva_cancel:{command_id}"),
+        ]])
+        await message.answer(
+            f"⚠️ Это действие изменит файлы на ПК: «{command_text}».\nПодтверди выполнение:",
+            reply_markup=keyboard,
+        )
+        return
+
+    command_id = await add_eva_command(message.from_user.id, command_text, action_json=action_json)
+    sent = await push_command_to_agents(command_id, action_json)
 
     if sent:
         await message.answer(f"📤 Команда «{command_text}» отправлена Еве, жду результат...")
@@ -521,6 +550,36 @@ async def cmd_eva(message: Message):
             f"📥 Команда «{command_text}» сохранена в очередь — "
             "desktop-агент сейчас не на связи, выполнится при подключении."
         )
+
+# ----- Ева: подтверждение/отмена файловой операции -----
+@router.callback_query(lambda c: c.data and (c.data.startswith("eva_confirm:") or c.data.startswith("eva_cancel:")))
+async def handle_eva_command_confirmation(callback: CallbackQuery):
+    action, command_id_str = callback.data.split(":")
+    command_id = int(command_id_str)
+
+    command = await get_eva_command(command_id)
+    if not command:
+        await callback.answer("Команда не найдена.", show_alert=True)
+        return
+
+    # Подтвердить может либо тот, кто её запросил, либо владелец
+    if callback.from_user.id != command["requested_by"] and not await is_owner(callback.from_user.id):
+        await callback.answer("Подтвердить может только автор команды или владелец.", show_alert=True)
+        return
+
+    if command["status"] != "awaiting_confirmation":
+        await callback.answer("Эта команда уже обработана.", show_alert=True)
+        return
+
+    if action == "eva_confirm":
+        await update_eva_command_status(command_id, "pending")
+        sent = await push_command_to_agents(command_id, command["action_json"])
+        suffix = "\n\n📤 Отправлено Еве." if sent else "\n\n📥 В очереди — агент сейчас не на связи."
+        await callback.message.edit_text(callback.message.text + suffix)
+    else:
+        await update_eva_command_status(command_id, "cancelled")
+        await callback.message.edit_text(callback.message.text + "\n\n❌ Отменено.")
+    await callback.answer()
 
 # ----- Обработка текста (запоминание + AI-ответ) -----
 @router.message(lambda msg: msg.text is not None)

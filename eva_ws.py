@@ -32,13 +32,15 @@ def is_agent_connected() -> bool:
     return len(_connected_agents) > 0
 
 
-async def push_command_to_agents(command_id: int, command_text: str) -> bool:
-    """Пытается сразу отправить команду подключённому агенту.
+async def push_command_to_agents(command_id: int, action_json: str) -> bool:
+    """Пытается сразу отправить структурированное действие подключённому
+    агенту. action_json — JSON-строка вида {"action": "...", "params": {...}}.
     Возвращает True, если хотя бы один агент получил её (иначе она
     останется в статусе 'pending' и уйдёт агенту при следующем подключении)."""
     if not _connected_agents:
         return False
-    payload = json.dumps({"type": "command", "id": command_id, "text": command_text})
+    action_data = json.loads(action_json)
+    payload = json.dumps({"type": "command", "id": command_id, **action_data})
     sent = False
     for ws in list(_connected_agents.values()):
         try:
@@ -70,7 +72,8 @@ async def eva_ws_handler(request: web.Request) -> web.WebSocketResponse:
     # Досылаем всё, что накопилось, пока агента не было на связи
     pending = await get_pending_eva_commands()
     for cmd in pending:
-        await push_command_to_agents(cmd["id"], cmd["command_text"])
+        if cmd.get("action_json"):
+            await push_command_to_agents(cmd["id"], cmd["action_json"])
 
     try:
         async for msg in ws:
