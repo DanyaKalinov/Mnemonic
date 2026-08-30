@@ -25,7 +25,7 @@ from db import (
 from reminder_parser import parse_reminder_text
 from eva_command_parser import parse_eva_command
 from memory import add_memory
-from ai_core import get_ai_response, describe_image, transcribe_voice
+from ai_core import get_ai_response, describe_image, transcribe_voice, interpret_eva_command
 from eva_ws import is_agent_connected, push_command_to_agents
 from bot_commands import sync_commands_for_user
 
@@ -44,6 +44,25 @@ def _eva_access_line(user: dict) -> str:
     if user["eva_access"] == "pending":
         return "🤖 Доступ к полным функциям (Ева): ⏳ заявка на рассмотрении"
     return "🤖 Доступ к полным функциям (Ева): ❌ нет — запросить: /eva_request"
+
+
+# ----- Человекочитаемое описание действия Евы для запроса подтверждения -----
+def _describe_eva_action(action: str, params: dict) -> str:
+    if action == "create_file":
+        return f"Ева создаст файл «{params.get('path')}»."
+    if action == "delete_file":
+        return f"Ева удалит файл «{params.get('path')}»."
+    if action == "edit_file":
+        verb = "допишет в" if params.get("mode") == "append" else "перезапишет"
+        return f"Ева {verb} файл «{params.get('path')}»."
+    if action == "copy_file":
+        return f"Ева скопирует «{params.get('src')}» в «{params.get('dst')}»."
+    if action == "move_file":
+        return f"Ева перенесёт «{params.get('src')}» в «{params.get('dst')}» (исходный файл исчезнет оттуда, где был)."
+    if action == "power_action":
+        labels = {"shutdown": "выключит компьютер", "restart": "перезагрузит компьютер", "lock": "заблокирует компьютер"}
+        return f"Ева {labels.get(params.get('action'), 'выполнит действие с питанием ПК')}."
+    return "Это действие изменит данные или состояние ПК."
 
 
 # ----- Уведомление админа о новой/повторной заявке -----
@@ -511,21 +530,38 @@ async def cmd_eva(message: Message):
             "Использование: /eva <команда>\n"
             "Например:\n"
             "• /eva открой блокнот\n"
+            "• /eva открой сайт youtube.com\n"
             "• /eva создай файл notes.txt с текстом купить молоко\n"
             "• /eva прочитай файл notes.txt\n"
-            "• /eva удали файл notes.txt"
+            "• /eva удали файл notes.txt\n"
+            "• /eva сделай скриншот\n"
+            "• /eva покажи файлы в загрузках\n"
+            "• /eva найди файл отчёт\n"
+            "• /eva сделай громче\n"
+            "• /eva заблокируй компьютер\n\n"
+            "Можно и свободной формулировкой — если не узнаю фразу по "
+            "шаблону, попробую понять через ИИ."
         )
         return
 
     parsed = parse_eva_command(command_text)
-    if not parsed.ok:
-        await message.answer(parsed.error)
-        return
+    if parsed.ok:
+        action, params, requires_confirmation = parsed.action, parsed.params, parsed.requires_confirmation
+    else:
+        # Жёсткий шаблон не подошёл — пробуем понять свободную формулировку
+        # через Gemini, строго в рамках того же набора разрешённых действий.
+        ai_result = await interpret_eva_command(command_text)
+        if not ai_result.get("action"):
+            await message.answer(ai_result.get("error") or parsed.error)
+            return
+        action = ai_result["action"]
+        params = ai_result["params"]
+        requires_confirmation = ai_result.get("requires_confirmation", False)
 
-    action_json = json.dumps({"action": parsed.action, "params": parsed.params})
+    action_json = json.dumps({"action": action, "params": params})
 
-    if parsed.requires_confirmation:
-        # Файловые операции (создание/удаление) не уходят агенту сразу —
+    if requires_confirmation:
+        # Разрушительные действия (файлы, питание ПК) не уходят агенту сразу —
         # сначала спрашиваем подтверждение владельца прямо здесь, в Telegram.
         command_id = await add_eva_command(
             message.from_user.id, command_text, action_json=action_json, status="awaiting_confirmation",
@@ -535,7 +571,7 @@ async def cmd_eva(message: Message):
             InlineKeyboardButton(text="❌ Отменить", callback_data=f"eva_cancel:{command_id}"),
         ]])
         await message.answer(
-            f"⚠️ Это действие изменит файлы на ПК: «{command_text}».\nПодтверди выполнение:",
+            f"⚠️ {_describe_eva_action(action, params)}\nПодтверди выполнение:",
             reply_markup=keyboard,
         )
         return

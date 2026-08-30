@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from dotenv import load_dotenv
 from google import genai
@@ -148,3 +149,86 @@ async def transcribe_voice(file_path: str) -> str:
     except Exception as e:
         print(f"❌ Ошибка Groq (распознавание голоса): {e}")
         return "😵 Не смог разобрать голосовое."
+
+
+# Действия, которые агент реально умеет выполнять (должно совпадать с тем,
+# что понимает eva_command_parser.py и eva_agent/actions.py). Модели строго
+# запрещено придумывать действие вне этого списка — она либо выбирает
+# что-то отсюда, либо честно отвечает, что не поняла команду.
+_EVA_ACTIONS_SCHEMA = """
+- open_app: {"app": "название программы"}
+- open_website: {"url": "адрес сайта"}
+- create_file: {"path": "имя файла", "content": "текст"}
+- read_file: {"path": "имя файла"}
+- delete_file: {"path": "имя файла"}
+- edit_file: {"path": "имя файла", "mode": "append" или "overwrite", "content": "текст"}
+- copy_file: {"src": "откуда", "dst": "куда"}
+- move_file: {"src": "откуда", "dst": "куда"}
+- list_files: {"folder": "название папки, например 'загрузки' или 'документы'"}
+- search_file: {"query": "что искать"}
+- screenshot: {}
+- set_volume: {"direction": "up"/"down"/"mute"/"unmute"} или {"level": число от 0 до 100}
+- power_action: {"action": "shutdown"/"restart"/"lock"}
+"""
+
+# Действия, которые меняют/удаляют данные или влияют на работу ПК целиком —
+# для них ВСЕГДА нужно подтверждение, даже если модель сама так не подумала.
+_DESTRUCTIVE_ACTIONS = {"create_file", "delete_file", "edit_file", "copy_file", "move_file", "power_action"}
+
+
+async def interpret_eva_command(text: str) -> dict:
+    """Свободный разбор команды Еве через Gemini — подключается как запасной
+    вариант, когда жёсткие шаблоны eva_command_parser.py не распознали
+    фразу. Модель обязана выбрать action СТРОГО из списка выше или вернуть
+    action: null, если команда не про один из этих сценариев — это не
+    произвольное выполнение чего угодно, а классификация в рамках уже
+    реализованного набора безопасных действий.
+
+    Возвращает dict: {"action": str|None, "params": dict, "error": str|None}
+    """
+    if not GOOGLE_API_KEY:
+        return {"action": None, "params": {}, "error": "⚠️ Не настроен API-ключ Google Gemini."}
+
+    prompt = (
+        "Ты помогаешь разобрать команду голосового ассистента Евы в строго "
+        "структурированный JSON. Вот список действий, которые реально умеет "
+        f"выполнять агент, и их параметры:\n{_EVA_ACTIONS_SCHEMA}\n"
+        f"Команда пользователя: «{text}»\n\n"
+        "Ответь ТОЛЬКО валидным JSON без пояснений и без markdown-разметки, "
+        'строго в виде {"action": "...", "params": {...}}. '
+        "Если команда явно не про одно из перечисленных действий — верни "
+        '{"action": null, "params": {}}. Никогда не придумывай действие, '
+        "которого нет в списке."
+    )
+    try:
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-flash-lite-latest",
+            contents=[prompt],
+        )
+        raw = response.text.strip()
+        # На случай, если модель всё же обернёт ответ в ```json ... ``` — снимаем разметку
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            raw = raw[4:] if raw.lower().startswith("json") else raw
+
+        data = json.loads(raw)
+        action = data.get("action")
+        params = data.get("params", {}) or {}
+
+        if action is None:
+            return {"action": None, "params": {}, "error": None}
+
+        known_actions = {line.split(":")[0].lstrip("- ").strip() for line in _EVA_ACTIONS_SCHEMA.strip().split("\n")}
+        if action not in known_actions:
+            return {"action": None, "params": {}, "error": None}
+
+        return {
+            "action": action,
+            "params": params,
+            "requires_confirmation": action in _DESTRUCTIVE_ACTIONS,
+            "error": None,
+        }
+    except Exception as e:
+        print(f"❌ Ошибка AI-разбора команды Евы: {e}")
+        return {"action": None, "params": {}, "error": "😵 Не смог разобрать команду."}

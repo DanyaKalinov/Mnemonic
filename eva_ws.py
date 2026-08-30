@@ -14,10 +14,12 @@ WebSocket-мост между сервером (Мнемоник/Ева) и desk
 Пока это только инфраструктура (этап 1) — самого desktop-агента ещё нет,
 но эндпоинт уже готов его принять.
 """
+import base64
 import json
 from typing import Optional
 
 from aiogram import Bot
+from aiogram.types import BufferedInputFile
 from aiohttp import web, WSMsgType
 
 from config import EVA_AGENT_SECRET
@@ -112,10 +114,21 @@ async def _handle_agent_message(raw: str, bot: Bot) -> None:
         return
 
     icon = "✅" if status == "done" else "⚠️"
+    image_b64: Optional[str] = data.get("image_base64")
+
     try:
-        await bot.send_message(
-            command["requested_by"],
-            f"{icon} Ева выполнила команду «{command['command_text']}»:\n{result}",
-        )
+        if image_b64:
+            image_bytes = base64.b64decode(image_b64)
+            photo = BufferedInputFile(image_bytes, filename="screenshot.png")
+            await bot.send_photo(
+                command["requested_by"],
+                photo=photo,
+                caption=f"{icon} Ева выполнила команду «{command['command_text']}»",
+            )
+        else:
+            await bot.send_message(
+                command["requested_by"],
+                f"{icon} Ева выполнила команду «{command['command_text']}»:\n{result}",
+            )
     except Exception as e:
         print(f"⚠️ Не удалось уведомить о результате команды {command_id}: {e}", flush=True)
