@@ -82,7 +82,7 @@ async def add_user(
 async def get_user(user_id: int) -> Optional[dict]:
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT user_id, settings, status, role, eva_access, created_at FROM users WHERE user_id = $1",
+            "SELECT user_id, settings, status, role, eva_access, last_digest_at, created_at FROM users WHERE user_id = $1",
             user_id,
         )
     if row is None:
@@ -93,6 +93,7 @@ async def get_user(user_id: int) -> Optional[dict]:
         "status": row["status"],
         "role": row["role"],
         "eva_access": row["eva_access"],
+        "last_digest_at": row["last_digest_at"],
         "created_at": row["created_at"],
     }
 

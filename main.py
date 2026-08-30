@@ -1,7 +1,8 @@
 import asyncio
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -73,30 +74,55 @@ async def check_reminders(bot: Bot):
 
 
 # === ФОНОВАЯ ЗАДАЧА ДЛЯ ЕЖЕДНЕВНОГО ДАЙДЖЕСТА ===
-# Раз в сутки, около 9:00 по времени сервера (Render по умолчанию — UTC),
-# собирает саммари новых записей памяти за последние 24 часа для каждого
-# одобренного пользователя и присылает его.
+# Проверяет раз в 10 минут: для каждого одобренного пользователя — сейчас
+# ли у него 9:00 УТРА ПО ЕГО СОБСТВЕННОМУ часовому поясу (не по времени
+# сервера — Render работает в UTC, а пользователи могут быть в любом
+# поясе), и не отправляли ли ему дайджест уже сегодня (по его же дате).
 async def send_daily_digest(bot: Bot):
     while True:
-        now = datetime.now()
-        if now.hour == 9:
-            user_ids = await list_approved_users()
-            for user_id in user_ids:
-                entries = await get_recent_memories(user_id, hours=24)
-                if entries:
-                    texts = [e['text'] for e in entries]
-                    summary = await summarize_for_digest(texts)
-                    if summary:
-                        try:
-                            await bot.send_message(user_id, f"📰 Дайджест за день:\n\n{summary}")
-                            await set_last_digest_at(user_id)
-                        except Exception as e:
-                            print(f"Не удалось отправить дайджест {user_id}: {e}")
-            # Дайджест разослан — ждём час, чтобы не разослать его ещё раз в те же 9:00
-            await asyncio.sleep(3600)
-        else:
-            # Не наш час — проверяем не слишком часто
-            await asyncio.sleep(300)
+        user_ids = await list_approved_users()
+        for user_id in user_ids:
+            user = await get_user(user_id)
+            if user is None:
+                continue
+
+            tz_name = (user["settings"] or {}).get("timezone") or "UTC"
+            try:
+                tz = ZoneInfo(tz_name)
+            except Exception:
+                tz = ZoneInfo("UTC")
+
+            local_now = datetime.now(timezone.utc).astimezone(tz)
+            if local_now.hour != 9:
+                continue
+
+            last_digest_at = user.get("last_digest_at")
+            if last_digest_at is not None:
+                last_local_date = last_digest_at.astimezone(tz).date()
+                if last_local_date == local_now.date():
+                    continue  # сегодня уже отправляли
+
+            entries = await get_recent_memories(user_id, hours=24)
+            if not entries:
+                await set_last_digest_at(user_id)  # чтобы не проверять его снова весь час
+                continue
+
+            digest_entries = [
+                {
+                    "text": e["text"],
+                    "created_at_local": e["created_at"].astimezone(tz).strftime("%d.%m.%Y %H:%M"),
+                }
+                for e in entries
+            ]
+            today_str = local_now.strftime("%d.%m.%Y")
+            summary = await summarize_for_digest(digest_entries, today_str)
+            if summary:
+                try:
+                    await bot.send_message(user_id, f"📰 Дайджест за день:\n\n{summary}")
+                    await set_last_digest_at(user_id)
+                except Exception as e:
+                    print(f"Не удалось отправить дайджест {user_id}: {e}")
+        await asyncio.sleep(600)
 
 
 async def on_startup(bot: Bot):
