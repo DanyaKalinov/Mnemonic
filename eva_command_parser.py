@@ -45,7 +45,9 @@ USAGE_ERROR = (
     "• /eva покажи файлы в загрузках\n"
     "• /eva найди файл отчёт\n"
     "• /eva сделай громче\n"
-    "• /eva заблокируй компьютер"
+    "• /eva заблокируй компьютер\n"
+    "• /eva напиши купить молоко\n"
+    "• /eva нажми ctrl+s"
 )
 NO_FILENAME_ERROR = "⚠️ Не нашёл имя файла (нужно расширение, например notes.txt)."
 
@@ -97,6 +99,12 @@ OVERWRITE_FILE_PATTERN = re.compile(r'перепиши\s+файл\s+(\S+)\s+те
 
 # ----- Поиск -----
 SEARCH_FILE_PATTERN = re.compile(r'найди\s+файл\s+(.+)$', re.IGNORECASE)
+
+# ----- Печать текста и горячие клавиши (базовое управление внутри программ) -----
+# Печатает в то окно, которое сейчас в фокусе — команду логично слать
+# СЛЕДОМ за "открой <программа>", когда окно уже открылось и в фокусе.
+TYPE_TEXT_PATTERN = re.compile(r'(?:напиши|напечатай|введи)\s+(.+)$', re.IGNORECASE)
+PRESS_KEY_PATTERN = re.compile(r'нажми\s+(.+)$', re.IGNORECASE)
 
 
 def parse_eva_command(text: str) -> EvaCommandParseResult:
@@ -193,6 +201,18 @@ def parse_eva_command(text: str) -> EvaCommandParseResult:
         if not filename_match:
             return EvaCommandParseResult(error=NO_FILENAME_ERROR)
         return EvaCommandParseResult(action="read_file", params={"path": filename_match.group(0)}, requires_confirmation=False)
+
+    # --- Печать текста / горячие клавиши (проверяем ДО общего "открой") ---
+    # Явно исключаем случаи со словом "файл" — это почти всегда относится
+    # к файловым действиям выше ("напиши в файл X текст ..."), а не к
+    # печати на экран.
+    if "файл" not in normalized:
+        m = TYPE_TEXT_PATTERN.search(text)
+        if m:
+            return EvaCommandParseResult(action="type_text", params={"text": m.group(1).strip()}, requires_confirmation=False)
+        m = PRESS_KEY_PATTERN.search(text)
+        if m:
+            return EvaCommandParseResult(action="press_key", params={"keys": m.group(1).strip()}, requires_confirmation=False)
 
     # --- Общее открытие приложения (самый общий шаблон — проверяется последним) ---
     if re.search(r'\b(открой|запусти)\b', normalized):

@@ -139,6 +139,25 @@ class TestEvaCommandParser(unittest.TestCase):
         self.assertFalse(r.ok)
         self.assertEqual(r.error, USAGE_ERROR)
 
+    def test_type_text(self):
+        r = parse_eva_command("напиши купить молоко")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.action, "type_text")
+        self.assertEqual(r.params["text"], "купить молоко")
+        self.assertFalse(r.requires_confirmation)
+
+    def test_press_key(self):
+        r = parse_eva_command("нажми ctrl+s")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.action, "press_key")
+        self.assertEqual(r.params["keys"], "ctrl+s")
+
+    def test_type_text_does_not_hijack_file_edit(self):
+        # "напиши в файл X текст Y" не должно перехватываться как печать
+        # на экран — эта фраза про файл, а не про активное окно.
+        r = parse_eva_command("напиши в файл notes.txt текст привет")
+        self.assertFalse(r.ok)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

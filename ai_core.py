@@ -169,6 +169,8 @@ _EVA_ACTIONS_SCHEMA = """
 - screenshot: {}
 - set_volume: {"direction": "up"/"down"/"mute"/"unmute"} или {"level": число от 0 до 100}
 - power_action: {"action": "shutdown"/"restart"/"lock"}
+- type_text: {"text": "что напечатать в активном окне"}
+- press_key: {"keys": "сочетание клавиш, например 'ctrl+s' или 'enter'"}
 """
 
 # Действия, которые меняют/удаляют данные или влияют на работу ПК целиком —
