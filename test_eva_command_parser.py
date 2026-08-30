@@ -4,7 +4,7 @@
 """
 import unittest
 
-from eva_command_parser import parse_eva_command, USAGE_ERROR, NO_FILENAME_ERROR
+from eva_command_parser import parse_eva_command, split_into_subcommands, USAGE_ERROR, NO_FILENAME_ERROR
 
 
 class TestEvaCommandParser(unittest.TestCase):
@@ -157,6 +157,28 @@ class TestEvaCommandParser(unittest.TestCase):
         # на экран — эта фраза про файл, а не про активное окно.
         r = parse_eva_command("напиши в файл notes.txt текст привет")
         self.assertFalse(r.ok)
+
+
+class TestSplitIntoSubcommands(unittest.TestCase):
+
+    def test_split_by_and(self):
+        parts = split_into_subcommands("открой блокнот и напиши привет")
+        self.assertEqual(parts, ["открой блокнот", "напиши привет"])
+
+    def test_split_by_potom_zatem(self):
+        parts = split_into_subcommands(
+            "запусти блокнот, потом напиши купить молоко, затем нажми ctrl+s"
+        )
+        self.assertEqual(parts, ["запусти блокнот", "напиши купить молоко", "нажми ctrl+s"])
+
+    def test_no_split_when_and_inside_word(self):
+        # "и" внутри "найди" не должно считаться разделителем
+        parts = split_into_subcommands("найди файл отчёт")
+        self.assertEqual(parts, ["найди файл отчёт"])
+
+    def test_single_command_no_split(self):
+        parts = split_into_subcommands("сделай скриншот")
+        self.assertEqual(parts, ["сделай скриншот"])
 
 
 if __name__ == "__main__":

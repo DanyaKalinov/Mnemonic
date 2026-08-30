@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import tempfile
+from typing import Optional
 from zoneinfo import ZoneInfo
 from aiogram import Router, types
 from aiogram.filters import Command
@@ -23,7 +24,7 @@ from db import (
     can_use_eva, set_eva_access, list_owner_ids, list_eva_access_users,
 )
 from reminder_parser import parse_reminder_text
-from eva_command_parser import parse_eva_command
+from eva_command_parser import parse_eva_command, split_into_subcommands
 from memory import add_memory
 from ai_core import get_ai_response, describe_image, transcribe_voice, interpret_eva_command
 from eva_ws import is_agent_connected, push_command_to_agents
@@ -518,6 +519,20 @@ async def cmd_agent_status(message: Message):
         )
 
 # ----- Ева: /eva <команда> — поставить задачу desktop-агенту -----
+async def _resolve_step(step_text: str) -> tuple[Optional[str], dict, bool, Optional[str]]:
+    """Разбирает ОДИН шаг команды: сначала жёсткий шаблон, если не подошёл —
+    свободный разбор через Gemini. Возвращает (action, params,
+    requires_confirmation, error). Если error не None — action будет None."""
+    parsed = parse_eva_command(step_text)
+    if parsed.ok:
+        return parsed.action, parsed.params, parsed.requires_confirmation, None
+
+    ai_result = await interpret_eva_command(step_text)
+    if not ai_result.get("action"):
+        return None, {}, False, (ai_result.get("error") or parsed.error)
+    return ai_result["action"], ai_result["params"], ai_result.get("requires_confirmation", False), None
+
+
 @router.message(Command("eva"))
 async def cmd_eva(message: Message):
     if not await can_use_eva(message.from_user.id):
@@ -538,31 +553,40 @@ async def cmd_eva(message: Message):
             "• /eva покажи файлы в загрузках\n"
             "• /eva найди файл отчёт\n"
             "• /eva сделай громче\n"
-            "• /eva заблокируй компьютер\n\n"
+            "• /eva заблокируй компьютер\n"
+            "• /eva напиши купить молоко\n"
+            "• /eva нажми ctrl+s\n\n"
             "Можно и свободной формулировкой — если не узнаю фразу по "
-            "шаблону, попробую понять через ИИ."
+            "шаблону, попробую понять через ИИ.\n\n"
+            "Можно и несколько действий подряд, через «и»/«потом»/«затем»:\n"
+            "• /eva открой блокнот и напиши купить молоко"
         )
         return
 
-    parsed = parse_eva_command(command_text)
-    if parsed.ok:
-        action, params, requires_confirmation = parsed.action, parsed.params, parsed.requires_confirmation
-    else:
-        # Жёсткий шаблон не подошёл — пробуем понять свободную формулировку
-        # через Gemini, строго в рамках того же набора разрешённых действий.
-        ai_result = await interpret_eva_command(command_text)
-        if not ai_result.get("action"):
-            await message.answer(ai_result.get("error") or parsed.error)
+    step_texts = split_into_subcommands(command_text)
+    steps = []  # [{"action":..., "params":...}]
+    descriptions = []  # человекочитаемое описание каждого шага
+    any_confirmation_needed = False
+
+    for i, step_text in enumerate(step_texts, start=1):
+        action, params, requires_confirmation, error = await _resolve_step(step_text)
+        if error:
+            prefix = f"Шаг {i} («{step_text}»): " if len(step_texts) > 1 else ""
+            await message.answer(f"{prefix}{error}")
             return
-        action = ai_result["action"]
-        params = ai_result["params"]
-        requires_confirmation = ai_result.get("requires_confirmation", False)
+        steps.append({"action": action, "params": params})
+        descriptions.append(_describe_eva_action(action, params))
+        any_confirmation_needed = any_confirmation_needed or requires_confirmation
 
-    action_json = json.dumps({"action": action, "params": params})
+    if len(steps) == 1:
+        action_json = json.dumps(steps[0])
+    else:
+        action_json = json.dumps({"steps": steps})
 
-    if requires_confirmation:
-        # Разрушительные действия (файлы, питание ПК) не уходят агенту сразу —
-        # сначала спрашиваем подтверждение владельца прямо здесь, в Telegram.
+    if any_confirmation_needed:
+        # Хотя бы один шаг меняет/удаляет данные или влияет на ПК — просим
+        # подтверждение сразу на ВСЮ последовательность одним запросом,
+        # а не по шагам, чтобы не заваливать владельца кнопками.
         command_id = await add_eva_command(
             message.from_user.id, command_text, action_json=action_json, status="awaiting_confirmation",
         )
@@ -570,10 +594,12 @@ async def cmd_eva(message: Message):
             InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"eva_confirm:{command_id}"),
             InlineKeyboardButton(text="❌ Отменить", callback_data=f"eva_cancel:{command_id}"),
         ]])
-        await message.answer(
-            f"⚠️ {_describe_eva_action(action, params)}\nПодтверди выполнение:",
-            reply_markup=keyboard,
-        )
+        if len(descriptions) == 1:
+            body = f"⚠️ {descriptions[0]}"
+        else:
+            numbered = "\n".join(f"{i}. {d}" for i, d in enumerate(descriptions, start=1))
+            body = f"⚠️ Последовательность из {len(descriptions)} шагов:\n{numbered}"
+        await message.answer(f"{body}\nПодтверди выполнение:", reply_markup=keyboard)
         return
 
     command_id = await add_eva_command(message.from_user.id, command_text, action_json=action_json)

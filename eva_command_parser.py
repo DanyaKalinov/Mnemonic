@@ -107,6 +107,18 @@ TYPE_TEXT_PATTERN = re.compile(r'(?:напиши|напечатай|введи)\
 PRESS_KEY_PATTERN = re.compile(r'нажми\s+(.+)$', re.IGNORECASE)
 
 
+# ----- Составные команды: "открой блокнот и напиши привет" -----
+# Разбивает одну фразу на несколько последовательных шагов по словам
+# "и" / "потом" / "затем", если они встречаются как отдельное слово
+# (а не как часть другого слова, например "найди" не разобьётся).
+STEP_SEPARATOR_PATTERN = re.compile(r'\s+(?:и\s+затем|затем|потом|и)\s+', re.IGNORECASE)
+
+
+def split_into_subcommands(text: str) -> list[str]:
+    parts = STEP_SEPARATOR_PATTERN.split(text)
+    return [p.strip(" ,.;") for p in parts if p.strip(" ,.;")]
+
+
 def parse_eva_command(text: str) -> EvaCommandParseResult:
     normalized = text.strip().lower()
 
