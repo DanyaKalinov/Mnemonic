@@ -47,7 +47,8 @@ USAGE_ERROR = (
     "• /eva сделай громче\n"
     "• /eva заблокируй компьютер\n"
     "• /eva напиши купить молоко\n"
-    "• /eva нажми ctrl+s"
+    "• /eva нажми ctrl+s\n"
+    "• /eva найди в яндексе погода через оперу"
 )
 NO_FILENAME_ERROR = "⚠️ Не нашёл имя файла (нужно расширение, например notes.txt)."
 
@@ -105,6 +106,85 @@ SEARCH_FILE_PATTERN = re.compile(r'найди\s+файл\s+(.+)$', re.IGNORECASE
 # СЛЕДОМ за "открой <программа>", когда окно уже открылось и в фокусе.
 TYPE_TEXT_PATTERN = re.compile(r'(?:напиши|напечатай|введи)\s+(.+)$', re.IGNORECASE)
 PRESS_KEY_PATTERN = re.compile(r'нажми\s+(.+)$', re.IGNORECASE)
+
+# ----- Поиск в интернете: выбор поисковика и/или браузера -----
+WEB_SEARCH_TRIGGER = re.compile(r'\b(?:найди|погугли|поищи|загугли)\b', re.IGNORECASE)
+SEARCH_ENGINE_PATTERNS = {
+    # порядок важен: "яндекс браузер" не должен спутаться с движком "яндекс"
+    "yandex": re.compile(r'\bяндекс(?!\s*браузер\w*)\w*\b', re.IGNORECASE),
+    "google": re.compile(r'\bгугл\w*\b|\bgoogle\b', re.IGNORECASE),
+    "bing": re.compile(r'\bбинг\w*\b|\bbing\b', re.IGNORECASE),
+    "duckduckgo": re.compile(r'duckduckgo|даккдакго', re.IGNORECASE),
+}
+SEARCH_BROWSER_PATTERNS = {
+    "yandex_browser": re.compile(r'яндекс\s*браузер\w*', re.IGNORECASE),
+    "chrome": re.compile(r'\bхром\w*\b|\bchrome\b', re.IGNORECASE),
+    "opera": re.compile(r'\bопер\w*\b|\bopera\b', re.IGNORECASE),
+    "firefox": re.compile(r'\bфаерфокс\w*\b|\bfirefox\b', re.IGNORECASE),
+    "edge": re.compile(r'\bэдж\w*\b|\bedge\b', re.IGNORECASE),
+}
+_SEARCH_STOPWORDS = re.compile(r'\b(?:информацию|инфу|про|об?|в|через|на|интернете?)\b', re.IGNORECASE)
+
+
+def _parse_web_search(text: str) -> Optional['EvaCommandParseResult']:
+    normalized = text.lower()
+    if not WEB_SEARCH_TRIGGER.search(normalized) or "файл" in normalized:
+        return None
+
+    working = WEB_SEARCH_TRIGGER.sub("", text, count=1)
+
+    engine = None
+    for name, pat in SEARCH_ENGINE_PATTERNS.items():
+        if pat.search(working):
+            engine = name
+            working = pat.sub("", working, count=1)
+            break
+
+    browser = None
+    for name, pat in SEARCH_BROWSER_PATTERNS.items():
+        if pat.search(working):
+            browser = name
+            working = pat.sub("", working, count=1)
+            break
+
+    query = _SEARCH_STOPWORDS.sub(" ", working)
+    query = re.sub(r'\s+', ' ', query).strip(" ,.-")
+
+    if not query:
+        return EvaCommandParseResult(error="⚠️ Не понял, что именно искать.")
+
+    params = {"query": query}
+    if engine:
+        params["engine"] = engine
+    if browser:
+        params["browser"] = browser
+    return EvaCommandParseResult(action="web_search", params=params, requires_confirmation=False)
+
+# ----- Поиск в интернете -----
+# Поисковик распознаётся из самой фразы ("найди в яндексе X" -> yandex),
+# "погугли" сразу подразумевает google. Браузер (необязательно) указывается
+# отдельно в конце фразы: "... через оперу" / "... в опере".
+SEARCH_ENGINE_WORDS = {
+    "гугле": "google", "google": "google",
+    "яндексе": "yandex", "yandex": "yandex", "яндекс": "yandex",
+    "бинге": "bing", "bing": "bing",
+}
+BROWSER_WORDS = {
+    "хроме": "chrome", "хром": "chrome", "chrome": "chrome",
+    "опере": "opera", "оперу": "opera", "опера": "opera", "opera": "opera",
+    "фаерфоксе": "firefox", "фаерфокс": "firefox",
+    "файрфоксе": "firefox", "файрфокс": "firefox", "firefox": "firefox",
+    "эдже": "edge", "эдж": "edge", "edge": "edge",
+}
+_BROWSER_SUFFIX_PATTERN = re.compile(
+    r'\s+(?:через|в)\s+(' + "|".join(BROWSER_WORDS.keys()) + r')\s*$', re.IGNORECASE,
+)
+WEB_SEARCH_PATTERN = re.compile(
+    r'(?:найди|поищи|найти|поискать)\s+(?:в\s+(гугле|google|яндексе|yandex|яндекс|бинге|bing)\s+)?'
+    r'(?:в\s+интернете\s+)?(.+)$',
+    re.IGNORECASE,
+)
+GOOGLE_IT_PATTERN = re.compile(r'погугли\s+(.+)$', re.IGNORECASE)
 
 
 # ----- Составные команды: "открой блокнот и напиши привет" -----
@@ -208,11 +288,38 @@ def parse_eva_command(text: str) -> EvaCommandParseResult:
         if m:
             return EvaCommandParseResult(action="search_file", params={"query": m.group(1).strip()}, requires_confirmation=False)
 
+    # --- Поиск в интернете (найди/погугли/поищи + НЕ про файл) ---
+    web_search_result = _parse_web_search(text)
+    if web_search_result is not None:
+        return web_search_result
+
     if re.search(r'\b(прочитай|покажи|открой)\b', normalized) and re.search(r'\bфайл\w*\b', normalized):
         filename_match = FILENAME_PATTERN.search(text)
         if not filename_match:
             return EvaCommandParseResult(error=NO_FILENAME_ERROR)
         return EvaCommandParseResult(action="read_file", params={"path": filename_match.group(0)}, requires_confirmation=False)
+
+    # --- Поиск в интернете (проверяем ДО общего "открой"/"найди файл" уже отработал выше) ---
+    if "файл" not in normalized:
+        m = GOOGLE_IT_PATTERN.search(text) or WEB_SEARCH_PATTERN.search(text)
+        if m:
+            groups = m.groups()
+            engine_word, query = (groups[0], groups[1]) if len(groups) == 2 else (None, groups[0])
+            engine = SEARCH_ENGINE_WORDS.get((engine_word or "").lower())
+
+            browser = None
+            browser_match = _BROWSER_SUFFIX_PATTERN.search(query)
+            if browser_match:
+                browser = BROWSER_WORDS.get(browser_match.group(1).lower())
+                query = query[:browser_match.start()].strip()
+
+            if query.strip():
+                params = {"query": query.strip()}
+                if engine:
+                    params["engine"] = engine
+                if browser:
+                    params["browser"] = browser
+                return EvaCommandParseResult(action="web_search", params=params, requires_confirmation=False)
 
     # --- Печать текста / горячие клавиши (проверяем ДО общего "открой") ---
     # Явно исключаем случаи со словом "файл" — это почти всегда относится

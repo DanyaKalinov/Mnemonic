@@ -171,6 +171,7 @@ _EVA_ACTIONS_SCHEMA = """
 - power_action: {"action": "shutdown"/"restart"/"lock"}
 - type_text: {"text": "что напечатать в активном окне"}
 - press_key: {"keys": "сочетание клавиш, например 'ctrl+s' или 'enter'"}
+- web_search: {"query": "что искать", "engine": "google"/"yandex"/"bing" (необязательно, по умолчанию google), "browser": "chrome"/"opera"/"firefox"/"edge" (необязательно, по умолчанию браузер по умолчанию)}
 """
 
 # Действия, которые меняют/удаляют данные или влияют на работу ПК целиком —

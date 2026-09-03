@@ -158,6 +158,74 @@ class TestEvaCommandParser(unittest.TestCase):
         r = parse_eva_command("напиши в файл notes.txt текст привет")
         self.assertFalse(r.ok)
 
+    def test_web_search_basic(self):
+        r = parse_eva_command("найди информацию о питоне")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.action, "web_search")
+        self.assertNotIn("engine", r.params)
+        self.assertNotIn("browser", r.params)
+        self.assertFalse(r.requires_confirmation)
+
+    def test_web_search_with_engine_yandex(self):
+        r = parse_eva_command("найди в яндексе погоду")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.action, "web_search")
+        self.assertEqual(r.params["engine"], "yandex")
+        self.assertEqual(r.params["query"], "погоду")
+
+    def test_web_search_with_browser(self):
+        r = parse_eva_command("поищи котиков через опера")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.params["browser"], "opera")
+        self.assertEqual(r.params["query"], "котиков")
+
+    def test_web_search_yandex_browser_not_confused_with_engine(self):
+        r = parse_eva_command("загугли рецепт борща в яндекс браузере")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.params["browser"], "yandex_browser")
+        self.assertNotIn("engine", r.params)
+
+    def test_web_search_does_not_hijack_search_file(self):
+        r = parse_eva_command("найди файл отчёт")
+        self.assertEqual(r.action, "search_file")
+
+    def test_web_search_default_google(self):
+        r = parse_eva_command("найди в интернете котики")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.action, "web_search")
+        self.assertEqual(r.params["query"], "котики")
+        self.assertNotIn("engine", r.params)
+        self.assertFalse(r.requires_confirmation)
+
+    def test_web_search_googli_shortcut(self):
+        r = parse_eva_command("погугли лучшие рестораны москвы")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.action, "web_search")
+        self.assertEqual(r.params["query"], "лучшие рестораны москвы")
+
+    def test_web_search_yandex_engine(self):
+        r = parse_eva_command("найди в яндексе погода")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.params["engine"], "yandex")
+        self.assertEqual(r.params["query"], "погода")
+
+    def test_web_search_with_browser_suffix(self):
+        r = parse_eva_command("найди новости через оперу")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.params["query"], "новости")
+        self.assertEqual(r.params["browser"], "opera")
+
+    def test_web_search_engine_and_browser_together(self):
+        r = parse_eva_command("найди в яндексе курс доллара через firefox")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.params["engine"], "yandex")
+        self.assertEqual(r.params["browser"], "firefox")
+        self.assertEqual(r.params["query"], "курс доллара")
+
+    def test_web_search_does_not_hijack_search_file(self):
+        r = parse_eva_command("найди файл отчёт")
+        self.assertEqual(r.action, "search_file")
+
 
 class TestSplitIntoSubcommands(unittest.TestCase):
 
