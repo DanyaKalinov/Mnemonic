@@ -185,10 +185,6 @@ class TestEvaCommandParser(unittest.TestCase):
         self.assertEqual(r.params["browser"], "yandex_browser")
         self.assertNotIn("engine", r.params)
 
-    def test_web_search_does_not_hijack_search_file(self):
-        r = parse_eva_command("найди файл отчёт")
-        self.assertEqual(r.action, "search_file")
-
     def test_web_search_default_google(self):
         r = parse_eva_command("найди в интернете котики")
         self.assertTrue(r.ok)
@@ -226,8 +222,36 @@ class TestEvaCommandParser(unittest.TestCase):
         r = parse_eva_command("найди файл отчёт")
         self.assertEqual(r.action, "search_file")
 
+    def test_ask_web_uznay(self):
+        r = parse_eva_command("узнай курс доллара сегодня")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.action, "ask_web")
+        self.assertEqual(r.params["query"], "курс доллара сегодня")
+        self.assertFalse(r.requires_confirmation)
 
-class TestSplitIntoSubcommands(unittest.TestCase):
+    def test_ask_web_aktualnaya_info(self):
+        r = parse_eva_command("актуальную информацию о погоде в москве")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.action, "ask_web")
+
+    def test_ui_click(self):
+        r = parse_eva_command("нажми кнопку сохранить в окне блокнот")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.action, "ui_click")
+        self.assertEqual(r.params["control"], "сохранить")
+        self.assertEqual(r.params["window"], "блокнот")
+        self.assertFalse(r.requires_confirmation)
+
+    def test_ui_list_controls(self):
+        r = parse_eva_command("какие кнопки в окне калькулятор")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.action, "ui_list_controls")
+        self.assertEqual(r.params["window"], "калькулятор")
+
+    def test_press_key_still_works_after_ui_click_added(self):
+        r = parse_eva_command("нажми ctrl+s")
+        self.assertEqual(r.action, "press_key")
+        self.assertEqual(r.params["keys"], "ctrl+s")
 
     def test_split_by_and(self):
         parts = split_into_subcommands("открой блокнот и напиши привет")

@@ -48,7 +48,9 @@ USAGE_ERROR = (
     "• /eva заблокируй компьютер\n"
     "• /eva напиши купить молоко\n"
     "• /eva нажми ctrl+s\n"
-    "• /eva найди в яндексе погода через оперу"
+    "• /eva найди в яндексе погода через оперу\n"
+    "• /eva узнай курс доллара сегодня\n"
+    "• /eva нажми кнопку сохранить в окне блокнот"
 )
 NO_FILENAME_ERROR = "⚠️ Не нашёл имя файла (нужно расширение, например notes.txt)."
 
@@ -105,7 +107,18 @@ SEARCH_FILE_PATTERN = re.compile(r'найди\s+файл\s+(.+)$', re.IGNORECASE
 # Печатает в то окно, которое сейчас в фокусе — команду логично слать
 # СЛЕДОМ за "открой <программа>", когда окно уже открылось и в фокусе.
 TYPE_TEXT_PATTERN = re.compile(r'(?:напиши|напечатай|введи)\s+(.+)$', re.IGNORECASE)
+# ----- Клик по кнопке/меню в конкретной программе (проверяем РАНЬШЕ
+# обычных горячих клавиш — то же триггерное слово "нажми") -----
+UI_CLICK_PATTERN = re.compile(r'нажми\s+кнопку\s+(.+?)\s+в\s+(?:окне\s+)?(.+)$', re.IGNORECASE)
+UI_LIST_PATTERN = re.compile(r'(?:какие\s+кнопки|покажи\s+элементы)\s+(?:есть\s+)?(?:в\s+)?(?:окне\s+)?(.+)$', re.IGNORECASE)
+
 PRESS_KEY_PATTERN = re.compile(r'нажми\s+(.+)$', re.IGNORECASE)
+
+# ----- Актуальный ответ из интернета текстом (не открытие браузера) -----
+ASK_WEB_PATTERN = re.compile(
+    r'\bузнай\b\s+(.+)$|актуальн\w*\s+(?:информаци\w*|новост\w*)\s*(?:о|про)?\s*(.+)$',
+    re.IGNORECASE,
+)
 
 # ----- Поиск в интернете: выбор поисковика и/или браузера -----
 WEB_SEARCH_TRIGGER = re.compile(r'\b(?:найди|погугли|поищи|загугли)\b', re.IGNORECASE)
@@ -201,6 +214,15 @@ def split_into_subcommands(text: str) -> list[str]:
 
 def parse_eva_command(text: str) -> EvaCommandParseResult:
     normalized = text.strip().lower()
+
+    # --- Актуальный ответ из интернета (текстом, не открытие браузера) —
+    # проверяем одним из первых, узкие явные триггеры ---
+    m = ASK_WEB_PATTERN.search(text)
+    if m:
+        query = (m.group(1) or m.group(2) or "").strip()
+        if not query:
+            return EvaCommandParseResult(error="⚠️ Уточни, о чём именно узнать.")
+        return EvaCommandParseResult(action="ask_web", params={"query": query}, requires_confirmation=False)
 
     # --- Питание ПК (проверяем раньше всего — явные, узкие фразы) ---
     if POWER_SHUTDOWN.search(normalized):
@@ -299,33 +321,20 @@ def parse_eva_command(text: str) -> EvaCommandParseResult:
             return EvaCommandParseResult(error=NO_FILENAME_ERROR)
         return EvaCommandParseResult(action="read_file", params={"path": filename_match.group(0)}, requires_confirmation=False)
 
-    # --- Поиск в интернете (проверяем ДО общего "открой"/"найди файл" уже отработал выше) ---
-    if "файл" not in normalized:
-        m = GOOGLE_IT_PATTERN.search(text) or WEB_SEARCH_PATTERN.search(text)
-        if m:
-            groups = m.groups()
-            engine_word, query = (groups[0], groups[1]) if len(groups) == 2 else (None, groups[0])
-            engine = SEARCH_ENGINE_WORDS.get((engine_word or "").lower())
-
-            browser = None
-            browser_match = _BROWSER_SUFFIX_PATTERN.search(query)
-            if browser_match:
-                browser = BROWSER_WORDS.get(browser_match.group(1).lower())
-                query = query[:browser_match.start()].strip()
-
-            if query.strip():
-                params = {"query": query.strip()}
-                if engine:
-                    params["engine"] = engine
-                if browser:
-                    params["browser"] = browser
-                return EvaCommandParseResult(action="web_search", params=params, requires_confirmation=False)
-
-    # --- Печать текста / горячие клавиши (проверяем ДО общего "открой") ---
+    # --- Печать текста / горячие клавиши / клик по кнопке (ДО общего "открой") ---
     # Явно исключаем случаи со словом "файл" — это почти всегда относится
     # к файловым действиям выше ("напиши в файл X текст ..."), а не к
     # печати на экран.
     if "файл" not in normalized:
+        m = UI_CLICK_PATTERN.search(text)
+        if m:
+            return EvaCommandParseResult(
+                action="ui_click", params={"control": m.group(1).strip(), "window": m.group(2).strip()},
+                requires_confirmation=False,
+            )
+        m = UI_LIST_PATTERN.search(text)
+        if m:
+            return EvaCommandParseResult(action="ui_list_controls", params={"window": m.group(1).strip()}, requires_confirmation=False)
         m = TYPE_TEXT_PATTERN.search(text)
         if m:
             return EvaCommandParseResult(action="type_text", params={"text": m.group(1).strip()}, requires_confirmation=False)

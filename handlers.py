@@ -26,7 +26,7 @@ from db import (
 from reminder_parser import parse_reminder_text
 from eva_command_parser import parse_eva_command, split_into_subcommands
 from memory import add_memory
-from ai_core import get_ai_response, describe_image, transcribe_voice, interpret_eva_command
+from ai_core import get_ai_response, describe_image, transcribe_voice, interpret_eva_command, ask_web
 from eva_ws import is_agent_connected, push_command_to_agents
 from bot_commands import sync_commands_for_user
 
@@ -555,7 +555,10 @@ async def cmd_eva(message: Message):
             "• /eva сделай громче\n"
             "• /eva заблокируй компьютер\n"
             "• /eva напиши купить молоко\n"
-            "• /eva нажми ctrl+s\n\n"
+            "• /eva нажми ctrl+s\n"
+            "• /eva найди в яндексе погода через оперу\n"
+            "• /eva узнай курс доллара сегодня\n"
+            "• /eva нажми кнопку сохранить в окне блокнот\n\n"
             "Можно и свободной формулировкой — если не узнаю фразу по "
             "шаблону, попробую понять через ИИ.\n\n"
             "Можно и несколько действий подряд, через «и»/«потом»/«затем»:\n"
@@ -564,8 +567,8 @@ async def cmd_eva(message: Message):
         return
 
     step_texts = split_into_subcommands(command_text)
-    steps = []  # [{"action":..., "params":...}]
-    descriptions = []  # человекочитаемое описание каждого шага
+    steps = []  # [{"action":..., "params":...}] — только то, что реально уйдёт агенту
+    descriptions = []  # человекочитаемое описание каждого шага для агента
     any_confirmation_needed = False
 
     for i, step_text in enumerate(step_texts, start=1):
@@ -574,9 +577,22 @@ async def cmd_eva(message: Message):
             prefix = f"Шаг {i} («{step_text}»): " if len(step_texts) > 1 else ""
             await message.answer(f"{prefix}{error}")
             return
+
+        if action == "ask_web":
+            # Отдельная ветка: это не команда агенту, а прямой вопрос к
+            # Gemini с доступом в интернет — отвечаем сразу текстом, без
+            # похода на ПК и без очереди команд.
+            answer = await ask_web(params.get("query", step_text))
+            await message.answer(f"🌐 {answer}")
+            continue
+
         steps.append({"action": action, "params": params})
         descriptions.append(_describe_eva_action(action, params))
         any_confirmation_needed = any_confirmation_needed or requires_confirmation
+
+    if not steps:
+        # Вся команда состояла только из "узнай ..." — агенту отправлять нечего
+        return
 
     if len(steps) == 1:
         action_json = json.dumps(steps[0])

@@ -172,6 +172,9 @@ _EVA_ACTIONS_SCHEMA = """
 - type_text: {"text": "что напечатать в активном окне"}
 - press_key: {"keys": "сочетание клавиш, например 'ctrl+s' или 'enter'"}
 - web_search: {"query": "что искать", "engine": "google"/"yandex"/"bing" (необязательно, по умолчанию google), "browser": "chrome"/"opera"/"firefox"/"edge" (необязательно, по умолчанию браузер по умолчанию)}
+- ui_click: {"window": "название окна программы", "control": "название кнопки или пункта меню"}
+- ui_list_controls: {"window": "название окна программы"}
+- ask_web: {"query": "вопрос, на который нужен АКТУАЛЬНЫЙ ответ из интернета текстом (не открытие браузера, а именно текстовый ответ)"}
 """
 
 # Действия, которые меняют/удаляют данные или влияют на работу ПК целиком —
@@ -235,3 +238,30 @@ async def interpret_eva_command(text: str) -> dict:
     except Exception as e:
         print(f"❌ Ошибка AI-разбора команды Евы: {e}")
         return {"action": None, "params": {}, "error": "😵 Не смог разобрать команду."}
+
+
+async def ask_web(query: str) -> str:
+    """Отвечает текстом с АКТУАЛЬНЫМИ данными из интернета — в отличие от
+    обычного get_ai_response (который знает только память пользователя и
+    "замороженные" знания модели), здесь подключён встроенный инструмент
+    Google Search у самой Gemini — модель реально ищет и опирается на
+    свежие результаты, а не только на то, что запомнила при обучении.
+
+    Выполняется целиком на сервере — desktop-агент тут не участвует,
+    ответ уходит владельцу прямо в Telegram.
+    """
+    if not GOOGLE_API_KEY:
+        return "⚠️ Не настроен API-ключ Google Gemini."
+    try:
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-flash-lite-latest",
+            contents=[query],
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+            ),
+        )
+        return response.text or "Не нашёл ничего конкретного по этому запросу."
+    except Exception as e:
+        print(f"❌ Ошибка веб-поиска Gemini (ask_web): {e}")
+        return "😵 Не смог найти информацию в интернете."
