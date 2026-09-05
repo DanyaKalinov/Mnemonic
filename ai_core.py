@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import requests
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -13,6 +14,8 @@ client = genai.Client(api_key=GOOGLE_API_KEY)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 async def get_ai_response(user_id: int, user_question: str) -> str:
     if not GOOGLE_API_KEY:
@@ -243,37 +246,66 @@ async def interpret_eva_command(text: str) -> dict:
 async def ask_web(query: str) -> str:
     """Отвечает текстом с АКТУАЛЬНЫМИ данными из интернета — в отличие от
     обычного get_ai_response (который знает только память пользователя и
-    "замороженные" знания модели), здесь подключён встроенный инструмент
-    Google Search у самой Gemini — модель реально ищет и опирается на
-    свежие результаты, а не только на то, что запомнила при обучении.
+    "замороженные" знания модели).
+
+    Устроено в два шага: сначала реальный поиск через Tavily (API
+    специально под ИИ-агентов — отдаёт уже сжатые релевантные фрагменты,
+    не нужно парсить HTML самим), затем обычный (без специальных
+    инструментов) вызов Gemini — просит сформулировать связный ответ по
+    найденным фрагментам. Специально НЕ используется встроенный инструмент
+    google_search у Gemini: у него отдельная, куда более скромная и
+    непрозрачная квота на бесплатном тарифе (см. историю с 429). Обычная
+    генерация текста, наоборот, считается по щедрой обычной квоте.
 
     Выполняется целиком на сервере — desktop-агент тут не участвует,
     ответ уходит владельцу прямо в Telegram.
     """
+    if not TAVILY_API_KEY:
+        return "⚠️ Не настроен ключ Tavily (TAVILY_API_KEY) — поиск в интернете недоступен."
     if not GOOGLE_API_KEY:
         return "⚠️ Не настроен API-ключ Google Gemini."
+
+    def _search_sync() -> dict:
+        response = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": TAVILY_API_KEY,
+                "query": query,
+                "search_depth": "basic",
+                "max_results": 5,
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    try:
+        search_data = await asyncio.to_thread(_search_sync)
+    except Exception as e:
+        print(f"❌ Ошибка запроса к Tavily (ask_web): {e}")
+        return "😵 Не смог найти информацию в интернете (ошибка поискового сервиса)."
+
+    results = search_data.get("results", [])
+    if not results:
+        return "Не нашёл ничего конкретного по этому запросу."
+
+    snippets = "\n\n".join(
+        f"Источник: {r.get('url', '')}\n{(r.get('content') or '')[:800]}"
+        for r in results[:5]
+    )
+    prompt = (
+        f"Вот результаты веб-поиска по запросу «{query}»:\n\n{snippets}\n\n"
+        "На основе этих результатов дай краткий, чёткий ответ на русском "
+        "языке (3-6 предложений). Если результаты противоречат друг другу "
+        "или не отвечают на вопрос напрямую — честно скажи об этом."
+    )
     try:
         response = await asyncio.to_thread(
             client.models.generate_content,
             model="gemini-flash-lite-latest",
-            contents=[query],
-            config=types.GenerateContentConfig(
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-            ),
+            contents=[prompt],
         )
-        return response.text or "Не нашёл ничего конкретного по этому запросу."
+        return response.text or "Нашёл результаты поиска, но не смог сформулировать ответ."
     except Exception as e:
-        error_str = str(e)
-        print(f"❌ Ошибка веб-поиска Gemini (ask_web): {e}")
-        if "RESOURCE_EXHAUSTED" in error_str or "429" in error_str:
-            return (
-                "😵 Упёрся в лимит запросов с веб-поиском Gemini — это отдельная, "
-                "гораздо более скромная квота специально для функции Google Search "
-                "внутри Gemini (известная особенность бесплатного тарифа), и она "
-                "НЕ видна на общем дашборде лимитов моделей — там показывается "
-                "только обычная квота генерации текста, которая может быть почти "
-                "не тронута. Попробуй позже, либо используй «/eva найди ...» — "
-                "это просто открывает браузер с результатами поиска и вообще "
-                "не расходует квоту Gemini (другой механизм, без ИИ)."
-            )
-        return "😵 Не смог найти информацию в интернете."
+        print(f"❌ Ошибка синтеза ответа Gemini (ask_web): {e}")
+        return "😵 Нашёл результаты поиска, но не смог сформулировать ответ (ошибка Gemini)."

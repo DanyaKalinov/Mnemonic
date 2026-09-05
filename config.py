@@ -27,3 +27,5 @@ if not GROQ_API_KEY:
     print("⚠️ Предупреждение: GROQ_API_KEY не задан — голосовые не будут работать.")
 if not EVA_AGENT_SECRET:
     print("⚠️ Предупреждение: EVA_AGENT_SECRET не задан — desktop-агент Евы не сможет подключиться.")
+if not os.getenv("TAVILY_API_KEY"):
+    print("⚠️ Предупреждение: TAVILY_API_KEY не задан — команда «/eva узнай ...» не будет работать.")
