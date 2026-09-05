@@ -139,6 +139,33 @@ SEARCH_BROWSER_PATTERNS = {
 _SEARCH_STOPWORDS = re.compile(r'\b(?:информацию|инфу|про|об?|в|через|на|интернете?)\b', re.IGNORECASE)
 
 
+# ----- Поиск на устройстве: "найди файл X" / "найди папку X" /
+# "найди X на компьютере/пк/диске" -----
+FIND_TRIGGER_PATTERN = re.compile(r'\bнайди\b', re.IGNORECASE)
+FILE_OR_FOLDER_WORD_PATTERN = re.compile(r'\bфайл\w*\b|\bпапк\w*\b', re.IGNORECASE)
+LOCAL_SEARCH_SCOPE_PATTERN = re.compile(r'на\s+(?:компьютере|пк|диске|устройстве)|в\s+файлах', re.IGNORECASE)
+
+
+def _parse_local_search(text: str) -> Optional['EvaCommandParseResult']:
+    normalized = text.lower()
+    if not FIND_TRIGGER_PATTERN.search(normalized):
+        return None
+    # Локальный поиск срабатывает, только если явно упомянут файл/папка,
+    # ИЛИ явно указан масштаб "на компьютере/пк/диске" — иначе оставляем
+    # это на _parse_web_search (например "найди в интернете котики").
+    if not (FILE_OR_FOLDER_WORD_PATTERN.search(normalized) or LOCAL_SEARCH_SCOPE_PATTERN.search(normalized)):
+        return None
+
+    working = FIND_TRIGGER_PATTERN.sub("", text, count=1)
+    working = FILE_OR_FOLDER_WORD_PATTERN.sub("", working)
+    working = LOCAL_SEARCH_SCOPE_PATTERN.sub("", working)
+    query = re.sub(r'\s+', ' ', working).strip(" ,.-")
+
+    if not query:
+        return EvaCommandParseResult(error="⚠️ Не понял, что именно искать на компьютере.")
+    return EvaCommandParseResult(action="search_file", params={"query": query}, requires_confirmation=False)
+
+
 def _parse_web_search(text: str) -> Optional['EvaCommandParseResult']:
     normalized = text.lower()
     if not WEB_SEARCH_TRIGGER.search(normalized) or "файл" in normalized:
@@ -305,12 +332,14 @@ def parse_eva_command(text: str) -> EvaCommandParseResult:
             action="create_file", params={"path": filename_match.group(0), "content": content}, requires_confirmation=True,
         )
 
-    if re.search(r'\bнайди\b', normalized) and re.search(r'\bфайл\w*\b', normalized):
-        m = SEARCH_FILE_PATTERN.search(text)
-        if m:
-            return EvaCommandParseResult(action="search_file", params={"query": m.group(1).strip()}, requires_confirmation=False)
+    # --- Поиск на устройстве: "найди файл X" / "найди папку X" /
+    # "найди X на компьютере" — проверяем ДО веб-поиска, чтобы такие
+    # фразы не улетали в браузер вместо реального поиска на диске.
+    local_search_result = _parse_local_search(text)
+    if local_search_result is not None:
+        return local_search_result
 
-    # --- Поиск в интернете (найди/погугли/поищи + НЕ про файл) ---
+    # --- Поиск в интернете (найди/погугли/поищи + НЕ про файл/папку/ПК) ---
     web_search_result = _parse_web_search(text)
     if web_search_result is not None:
         return web_search_result

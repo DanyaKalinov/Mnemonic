@@ -273,5 +273,34 @@ class TestEvaCommandParser(unittest.TestCase):
         self.assertEqual(parts, ["сделай скриншот"])
 
 
+class TestLocalSearchRegressions(unittest.TestCase):
+    """Регрессии на реальные баги: 'папку' не распознавалось, 'на компьютере'
+    не отрезалось от запроса и уводило в веб-поиск вместо локального."""
+
+    def test_find_folder_on_computer(self):
+        r = parse_eva_command("найди на компьютере папку eva_agent")
+        self.assertEqual(r.action, "search_file")
+        self.assertEqual(r.params["query"], "eva_agent")
+
+    def test_find_file_strips_trailing_scope_phrase(self):
+        r = parse_eva_command("найди файл brain bot на компьютере")
+        self.assertEqual(r.action, "search_file")
+        self.assertEqual(r.params["query"], "brain bot")
+
+    def test_find_file_still_works_as_before(self):
+        r = parse_eva_command("найди файл отчёт")
+        self.assertEqual(r.action, "search_file")
+        self.assertEqual(r.params["query"], "отчёт")
+
+    def test_internet_search_not_hijacked_by_local_search(self):
+        r = parse_eva_command("найди в интернете котики")
+        self.assertEqual(r.action, "web_search")
+
+    def test_yandex_search_not_hijacked_by_local_search(self):
+        r = parse_eva_command("найди в яндексе погоду")
+        self.assertEqual(r.action, "web_search")
+        self.assertEqual(r.params.get("engine"), "yandex")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
