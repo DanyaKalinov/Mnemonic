@@ -2,17 +2,24 @@
 WebSocket-мост между сервером (Мнемоник/Ева) и desktop-агентом на ПК.
 
 Как это работает:
-1. Desktop-агент подключается к /ws/eva с заголовком X-Eva-Agent-Secret.
+1. Desktop-агент подключается к /ws/eva с заголовками X-Eva-Agent-Secret
+   (секрет из .env, общий с сервером) и X-Eva-Owner-Id (Telegram ID
+   владельца, которому принадлежит этот ПК — проверяется по базе: должен
+   быть либо role='owner', либо иметь eva_access='granted').
 2. Сразу после подключения сервер отправляет ему все команды, которые
    накопились в очереди, пока агента не было на связи (status='pending').
-3. Когда владелец пишет команду боту в Telegram — она сохраняется в БД
-   и, если агент сейчас на связи, сразу же отправляется ему.
+3. Когда владелец пишет команду боту в Telegram (или произносит голосом —
+   см. eva_engine.py) — она сохраняется в БД и, если агент на связи,
+   сразу же уходит ему.
 4. Агент выполняет команду и присылает результат обратно
    ({"type": "result", "command_id": ..., "status": "done"|"error", "result": "..."}) —
    сервер обновляет БД и уведомляет владельца, который её запросил.
-
-Пока это только инфраструктура (этап 1) — самого desktop-агента ещё нет,
-но эндпоинт уже готов его принять.
+5. Агент также может прислать {"type": "voice_command", "text": "..."} —
+   это транскрибированная голосовая команда (после локального wake word +
+   распознавания речи на самой машине). Она проходит через ТОТ ЖЕ
+   конвейер (eva_engine.process_eva_command), что и текстовые команды —
+   включая обязательное подтверждение в Telegram для разрушительных
+   действий, даже если распознанный голос попросил об этом напрямую.
 """
 import base64
 import json
@@ -23,36 +30,10 @@ from aiogram.types import BufferedInputFile
 from aiohttp import web, WSMsgType
 
 from config import EVA_AGENT_SECRET
-from db import get_pending_eva_commands, update_eva_command_status, get_eva_command
-
-# Подключённые агенты. На практике обычно один (твой ПК), но структура
-# уже поддерживает несколько — просто словарь ws-соединений.
-_connected_agents: dict[str, web.WebSocketResponse] = {}
-
-
-def is_agent_connected() -> bool:
-    return len(_connected_agents) > 0
-
-
-async def push_command_to_agents(command_id: int, action_json: str) -> bool:
-    """Пытается сразу отправить структурированное действие подключённому
-    агенту. action_json — JSON-строка вида {"action": "...", "params": {...}}.
-    Возвращает True, если хотя бы один агент получил её (иначе она
-    останется в статусе 'pending' и уйдёт агенту при следующем подключении)."""
-    if not _connected_agents:
-        return False
-    action_data = json.loads(action_json)
-    payload = json.dumps({"type": "command", "id": command_id, **action_data})
-    sent = False
-    for ws in list(_connected_agents.values()):
-        try:
-            await ws.send_str(payload)
-            sent = True
-        except Exception as e:
-            print(f"⚠️ Не удалось отправить команду агенту: {e}", flush=True)
-    if sent:
-        await update_eva_command_status(command_id, "sent")
-    return sent
+from db import get_pending_eva_commands, update_eva_command_status, get_eva_command, can_use_eva
+from eva_agent_registry import (
+    register_agent, unregister_agent, push_command_to_agents, get_owner_id_for_agent,
+)
 
 
 async def eva_ws_handler(request: web.Request) -> web.WebSocketResponse:
@@ -62,12 +43,20 @@ async def eva_ws_handler(request: web.Request) -> web.WebSocketResponse:
     if request.headers.get("X-Eva-Agent-Secret") != EVA_AGENT_SECRET:
         return web.Response(status=403, text="Неверный секрет агента")
 
+    owner_id_raw = request.headers.get("X-Eva-Owner-Id")
+    if not owner_id_raw or not owner_id_raw.isdigit():
+        return web.Response(status=403, text="Нужен корректный заголовок X-Eva-Owner-Id")
+    owner_id = int(owner_id_raw)
+
+    if not await can_use_eva(owner_id):
+        return web.Response(status=403, text="У этого Telegram-аккаунта нет доступа к Еве")
+
     agent_id = request.headers.get("X-Eva-Agent-Id", "default")
 
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
-    _connected_agents[agent_id] = ws
-    print(f"🔌 Агент Евы подключился: {agent_id}", flush=True)
+    register_agent(agent_id, ws, owner_id)
+    print(f"🔌 Агент Евы подключился: {agent_id} (владелец {owner_id})", flush=True)
 
     bot: Bot = request.app["bot"]
 
@@ -80,26 +69,33 @@ async def eva_ws_handler(request: web.Request) -> web.WebSocketResponse:
     try:
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
-                await _handle_agent_message(msg.data, bot)
+                await _handle_agent_message(msg.data, bot, agent_id)
             elif msg.type == WSMsgType.ERROR:
                 print(f"⚠️ Ошибка WS-соединения с агентом {agent_id}: {ws.exception()}", flush=True)
     finally:
-        _connected_agents.pop(agent_id, None)
+        unregister_agent(agent_id)
         print(f"🔌 Агент Евы отключился: {agent_id}", flush=True)
 
     return ws
 
 
-async def _handle_agent_message(raw: str, bot: Bot) -> None:
+async def _handle_agent_message(raw: str, bot: Bot, agent_id: str) -> None:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
         print(f"⚠️ Агент прислал не-JSON: {raw[:200]}", flush=True)
         return
 
-    if data.get("type") != "result":
-        return
+    msg_type = data.get("type")
 
+    if msg_type == "result":
+        await _handle_result_message(data, bot)
+    elif msg_type == "voice_command":
+        await _handle_voice_command_message(data, bot, agent_id)
+    # неизвестные типы просто игнорируем — вперёд совместимость
+
+
+async def _handle_result_message(data: dict, bot: Bot) -> None:
     command_id: Optional[int] = data.get("command_id")
     status: str = data.get("status", "error")
     result: str = data.get("result", "")
@@ -132,3 +128,35 @@ async def _handle_agent_message(raw: str, bot: Bot) -> None:
             )
     except Exception as e:
         print(f"⚠️ Не удалось уведомить о результате команды {command_id}: {e}", flush=True)
+
+
+async def _handle_voice_command_message(data: dict, bot: Bot, agent_id: str) -> None:
+    """Голосовая команда с агента (после локального wake word + STT).
+    Проводим её через ТОТ ЖЕ конвейер, что и текстовые команды в Telegram —
+    см. докстринг модуля про границу безопасности."""
+    text = (data.get("text") or "").strip()
+    if not text:
+        return
+
+    owner_id = get_owner_id_for_agent(agent_id)
+    if owner_id is None:
+        print(f"⚠️ Голосовая команда от неизвестного агента {agent_id}, игнорирую", flush=True)
+        return
+
+    # Импорт внутри функции — избегаем цикла на уровне модулей
+    # (eva_engine.py импортирует push_command_to_agents из
+    # eva_agent_registry, а не из eva_ws, так что реального цикла нет,
+    # но держим импорт локально для ясности, что это специфично для
+    # голосовой обработки).
+    from eva_engine import process_eva_command
+    from eva_agent_registry import speak_to_owner
+
+    async def _reply(text: str) -> None:
+        # Для голоса — сразу и в Telegram (для истории), и озвучиваем на ПК
+        try:
+            await bot.send_message(owner_id, text)
+        except Exception as e:
+            print(f"⚠️ Не удалось отправить голосовой ответ в Telegram: {e}", flush=True)
+        await speak_to_owner(owner_id, text)
+
+    await process_eva_command(bot, owner_id, text, _reply, source="voice")

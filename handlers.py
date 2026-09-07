@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import tempfile
 from typing import Optional
@@ -20,14 +19,14 @@ from db import (
     add_reminder, get_user_reminders, snooze_reminder, delete_reminder,
     get_user_memories, delete_memory,
     list_users, get_stats,
-    set_user_role, is_owner, add_eva_command, get_eva_command, update_eva_command_status,
+    set_user_role, is_owner, get_eva_command, update_eva_command_status,
     can_use_eva, set_eva_access, list_owner_ids, list_eva_access_users,
 )
 from reminder_parser import parse_reminder_text
-from eva_command_parser import parse_eva_command, split_into_subcommands
 from memory import add_memory
-from ai_core import get_ai_response, describe_image, transcribe_voice, interpret_eva_command, ask_web
-from eva_ws import is_agent_connected, push_command_to_agents
+from ai_core import get_ai_response, describe_image, transcribe_voice
+from eva_agent_registry import is_agent_connected, push_command_to_agents
+from eva_engine import process_eva_command
 from bot_commands import sync_commands_for_user
 
 load_dotenv()
@@ -46,24 +45,7 @@ def _eva_access_line(user: dict) -> str:
         return "🤖 Доступ к полным функциям (Ева): ⏳ заявка на рассмотрении"
     return "🤖 Доступ к полным функциям (Ева): ❌ нет — запросить: /eva_request"
 
-
-# ----- Человекочитаемое описание действия Евы для запроса подтверждения -----
-def _describe_eva_action(action: str, params: dict) -> str:
-    if action == "create_file":
-        return f"Ева создаст файл «{params.get('path')}»."
-    if action == "delete_file":
-        return f"Ева удалит файл «{params.get('path')}»."
-    if action == "edit_file":
-        verb = "допишет в" if params.get("mode") == "append" else "перезапишет"
-        return f"Ева {verb} файл «{params.get('path')}»."
-    if action == "copy_file":
-        return f"Ева скопирует «{params.get('src')}» в «{params.get('dst')}»."
-    if action == "move_file":
-        return f"Ева перенесёт «{params.get('src')}» в «{params.get('dst')}» (исходный файл исчезнет оттуда, где был)."
-    if action == "power_action":
-        labels = {"shutdown": "выключит компьютер", "restart": "перезагрузит компьютер", "lock": "заблокирует компьютер"}
-        return f"Ева {labels.get(params.get('action'), 'выполнит действие с питанием ПК')}."
-    return "Это действие изменит данные или состояние ПК."
+# (Описание действий Евы для подтверждения теперь в eva_engine.describe_eva_action)
 
 
 # ----- Уведомление админа о новой/повторной заявке -----
@@ -519,18 +501,7 @@ async def cmd_agent_status(message: Message):
         )
 
 # ----- Ева: /eva <команда> — поставить задачу desktop-агенту -----
-async def _resolve_step(step_text: str) -> tuple[Optional[str], dict, bool, Optional[str]]:
-    """Разбирает ОДИН шаг команды: сначала жёсткий шаблон, если не подошёл —
-    свободный разбор через Gemini. Возвращает (action, params,
-    requires_confirmation, error). Если error не None — action будет None."""
-    parsed = parse_eva_command(step_text)
-    if parsed.ok:
-        return parsed.action, parsed.params, parsed.requires_confirmation, None
-
-    ai_result = await interpret_eva_command(step_text)
-    if not ai_result.get("action"):
-        return None, {}, False, (ai_result.get("error") or parsed.error)
-    return ai_result["action"], ai_result["params"], ai_result.get("requires_confirmation", False), None
+# (Разбор шагов команды теперь в eva_engine._resolve_step)
 
 
 @router.message(Command("eva"))
@@ -566,68 +537,7 @@ async def cmd_eva(message: Message):
         )
         return
 
-    step_texts = split_into_subcommands(command_text)
-    steps = []  # [{"action":..., "params":...}] — только то, что реально уйдёт агенту
-    descriptions = []  # человекочитаемое описание каждого шага для агента
-    any_confirmation_needed = False
-
-    for i, step_text in enumerate(step_texts, start=1):
-        action, params, requires_confirmation, error = await _resolve_step(step_text)
-        if error:
-            prefix = f"Шаг {i} («{step_text}»): " if len(step_texts) > 1 else ""
-            await message.answer(f"{prefix}{error}")
-            return
-
-        if action == "ask_web":
-            # Отдельная ветка: это не команда агенту, а прямой вопрос к
-            # Gemini с доступом в интернет — отвечаем сразу текстом, без
-            # похода на ПК и без очереди команд.
-            answer = await ask_web(params.get("query", step_text))
-            await message.answer(f"🌐 {answer}")
-            continue
-
-        steps.append({"action": action, "params": params})
-        descriptions.append(_describe_eva_action(action, params))
-        any_confirmation_needed = any_confirmation_needed or requires_confirmation
-
-    if not steps:
-        # Вся команда состояла только из "узнай ..." — агенту отправлять нечего
-        return
-
-    if len(steps) == 1:
-        action_json = json.dumps(steps[0])
-    else:
-        action_json = json.dumps({"steps": steps})
-
-    if any_confirmation_needed:
-        # Хотя бы один шаг меняет/удаляет данные или влияет на ПК — просим
-        # подтверждение сразу на ВСЮ последовательность одним запросом,
-        # а не по шагам, чтобы не заваливать владельца кнопками.
-        command_id = await add_eva_command(
-            message.from_user.id, command_text, action_json=action_json, status="awaiting_confirmation",
-        )
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"eva_confirm:{command_id}"),
-            InlineKeyboardButton(text="❌ Отменить", callback_data=f"eva_cancel:{command_id}"),
-        ]])
-        if len(descriptions) == 1:
-            body = f"⚠️ {descriptions[0]}"
-        else:
-            numbered = "\n".join(f"{i}. {d}" for i, d in enumerate(descriptions, start=1))
-            body = f"⚠️ Последовательность из {len(descriptions)} шагов:\n{numbered}"
-        await message.answer(f"{body}\nПодтверди выполнение:", reply_markup=keyboard)
-        return
-
-    command_id = await add_eva_command(message.from_user.id, command_text, action_json=action_json)
-    sent = await push_command_to_agents(command_id, action_json)
-
-    if sent:
-        await message.answer(f"📤 Команда «{command_text}» отправлена Еве, жду результат...")
-    else:
-        await message.answer(
-            f"📥 Команда «{command_text}» сохранена в очередь — "
-            "desktop-агент сейчас не на связи, выполнится при подключении."
-        )
+    await process_eva_command(message.bot, message.from_user.id, command_text, message.answer)
 
 # ----- Ева: подтверждение/отмена файловой операции -----
 @router.callback_query(lambda c: c.data and (c.data.startswith("eva_confirm:") or c.data.startswith("eva_cancel:")))
