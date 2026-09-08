@@ -253,6 +253,41 @@ class TestEvaCommandParser(unittest.TestCase):
         self.assertEqual(r.action, "press_key")
         self.assertEqual(r.params["keys"], "ctrl+s")
 
+    def test_close_app_requires_confirmation(self):
+        r = parse_eva_command("закрой блокнот")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.action, "close_app")
+        self.assertEqual(r.params["window"], "блокнот")
+        self.assertTrue(r.requires_confirmation)
+
+    def test_minimize_window(self):
+        r = parse_eva_command("сверни браузер")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.action, "minimize_window")
+        self.assertEqual(r.params["window"], "браузер")
+        self.assertFalse(r.requires_confirmation)
+
+    def test_maximize_window(self):
+        r = parse_eva_command("разверни блокнот")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.action, "maximize_window")
+        self.assertEqual(r.params["window"], "блокнот")
+        self.assertFalse(r.requires_confirmation)
+
+    def test_ui_type_text(self):
+        r = parse_eva_command("напиши привет в поле сообщение в окне телеграм")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.action, "ui_type_text")
+        self.assertEqual(r.params["text"], "привет")
+        self.assertEqual(r.params["control"], "сообщение")
+        self.assertEqual(r.params["window"], "телеграм")
+        self.assertFalse(r.requires_confirmation)
+
+    def test_plain_type_text_still_works(self):
+        r = parse_eva_command("напиши купить молоко")
+        self.assertEqual(r.action, "type_text")
+        self.assertEqual(r.params["text"], "купить молоко")
+
     def test_split_by_and(self):
         parts = split_into_subcommands("открой блокнот и напиши привет")
         self.assertEqual(parts, ["открой блокнот", "напиши привет"])

@@ -112,6 +112,18 @@ TYPE_TEXT_PATTERN = re.compile(r'(?:напиши|напечатай|введи)\
 UI_CLICK_PATTERN = re.compile(r'нажми\s+кнопку\s+(.+?)\s+в\s+(?:окне\s+)?(.+)$', re.IGNORECASE)
 UI_LIST_PATTERN = re.compile(r'(?:какие\s+кнопки|покажи\s+элементы)\s+(?:есть\s+)?(?:в\s+)?(?:окне\s+)?(.+)$', re.IGNORECASE)
 
+# Ввод текста НАПРЯМУЮ в конкретное поле (надёжнее слепой печати в
+# активное окно) — проверяем ДО обычного TYPE_TEXT_PATTERN, у них общие
+# триггерные слова.
+UI_TYPE_PATTERN = re.compile(
+    r'(?:напиши|введи|впиши)\s+(.+?)\s+в\s+пол[еэ]\s+(.+?)\s+в\s+(?:окне\s+)?(.+)$', re.IGNORECASE,
+)
+
+# Закрыть / свернуть / развернуть окно программы
+CLOSE_APP_PATTERN = re.compile(r'закрой\s+(.+)$', re.IGNORECASE)
+MINIMIZE_WINDOW_PATTERN = re.compile(r'сверни\s+(.+)$', re.IGNORECASE)
+MAXIMIZE_WINDOW_PATTERN = re.compile(r'разверни\s+(.+)$', re.IGNORECASE)
+
 PRESS_KEY_PATTERN = re.compile(r'нажми\s+(.+)$', re.IGNORECASE)
 
 # ----- Актуальный ответ из интернета текстом (не открытие браузера) -----
@@ -259,6 +271,17 @@ def parse_eva_command(text: str) -> EvaCommandParseResult:
     if POWER_LOCK.search(normalized):
         return EvaCommandParseResult(action="power_action", params={"action": "lock"}, requires_confirmation=True)
 
+    # --- Закрыть / свернуть / развернуть окно программы ---
+    m = CLOSE_APP_PATTERN.search(text)
+    if m:
+        return EvaCommandParseResult(action="close_app", params={"window": m.group(1).strip()}, requires_confirmation=True)
+    m = MINIMIZE_WINDOW_PATTERN.search(text)
+    if m:
+        return EvaCommandParseResult(action="minimize_window", params={"window": m.group(1).strip()}, requires_confirmation=False)
+    m = MAXIMIZE_WINDOW_PATTERN.search(text)
+    if m:
+        return EvaCommandParseResult(action="maximize_window", params={"window": m.group(1).strip()}, requires_confirmation=False)
+
     # --- Скриншот ---
     if SCREENSHOT_PATTERN.search(normalized):
         return EvaCommandParseResult(action="screenshot", params={}, requires_confirmation=False)
@@ -364,6 +387,13 @@ def parse_eva_command(text: str) -> EvaCommandParseResult:
         m = UI_LIST_PATTERN.search(text)
         if m:
             return EvaCommandParseResult(action="ui_list_controls", params={"window": m.group(1).strip()}, requires_confirmation=False)
+        m = UI_TYPE_PATTERN.search(text)
+        if m:
+            return EvaCommandParseResult(
+                action="ui_type_text",
+                params={"text": m.group(1).strip(), "control": m.group(2).strip(), "window": m.group(3).strip()},
+                requires_confirmation=False,
+            )
         m = TYPE_TEXT_PATTERN.search(text)
         if m:
             return EvaCommandParseResult(action="type_text", params={"text": m.group(1).strip()}, requires_confirmation=False)

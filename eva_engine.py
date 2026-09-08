@@ -56,6 +56,8 @@ def describe_eva_action(action: str, params: dict) -> str:
     if action == "power_action":
         labels = {"shutdown": "выключит компьютер", "restart": "перезагрузит компьютер", "lock": "заблокирует компьютер"}
         return f"Ева {labels.get(params.get('action'), 'выполнит действие с питанием ПК')}."
+    if action == "close_app":
+        return f"Ева закроет окно «{params.get('window')}» (несохранённые данные внутри могут быть потеряны)."
     return "Это действие изменит данные или состояние ПК."
 
 

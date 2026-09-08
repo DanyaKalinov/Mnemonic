@@ -177,12 +177,16 @@ _EVA_ACTIONS_SCHEMA = """
 - web_search: {"query": "что искать", "engine": "google"/"yandex"/"bing" (необязательно, по умолчанию google), "browser": "chrome"/"opera"/"firefox"/"edge" (необязательно, по умолчанию браузер по умолчанию)}
 - ui_click: {"window": "название окна программы", "control": "название кнопки или пункта меню"}
 - ui_list_controls: {"window": "название окна программы"}
+- close_app: {"window": "название окна программы"}
+- minimize_window: {"window": "название окна программы"}
+- maximize_window: {"window": "название окна программы"}
+- ui_type_text: {"window": "название окна программы", "control": "название поля ввода", "text": "что напечатать"}
 - ask_web: {"query": "вопрос, на который нужен АКТУАЛЬНЫЙ ответ из интернета текстом (не открытие браузера, а именно текстовый ответ)"}
 """
 
 # Действия, которые меняют/удаляют данные или влияют на работу ПК целиком —
 # для них ВСЕГДА нужно подтверждение, даже если модель сама так не подумала.
-_DESTRUCTIVE_ACTIONS = {"create_file", "delete_file", "edit_file", "copy_file", "move_file", "power_action"}
+_DESTRUCTIVE_ACTIONS = {"create_file", "delete_file", "edit_file", "copy_file", "move_file", "power_action", "close_app"}
 
 
 async def interpret_eva_command(text: str) -> dict:
