@@ -92,6 +92,17 @@ OPEN_FILE_PATTERN = re.compile(
     r'(?:открой|откройте|открыть|запусти)\s+(?:файл|документ)\s+(.+)$', re.IGNORECASE,
 )
 
+# ----- Открытие папки -----
+# "открой папку загрузки", "покажи папку Проекты"
+OPEN_FOLDER_PATTERN = re.compile(
+    r'(?:открой|откройте|открыть|запусти|покажи)\s+папку\s+(.+)$', re.IGNORECASE,
+)
+# Составная команда: "найди и открой папку X" — не должна разбиваться
+# сплиттером, а должна распознаваться как одно действие (open_folder).
+FIND_OPEN_FOLDER_PATTERN = re.compile(
+    r'найди(?:\s+\S+)?\s+открой\s+папку\s+(.+)$', re.IGNORECASE,
+)
+
 # ----- Сайты (проверяются раньше общего "открой", т.к. тоже используют это слово) -----
 OPEN_SITE_PATTERN = re.compile(r'(?:открой|зайди на|перейди на)\s+сайт\s+(.+)$', re.IGNORECASE)
 OPEN_SITE_DOMAIN_PATTERN = re.compile(
@@ -277,6 +288,9 @@ STEP_SEPARATOR_PATTERN = re.compile(r'\s+(?:и\s+затем|затем|пото�
 
 
 def split_into_subcommands(text: str) -> list[str]:
+    # "найди и открой папку X" — одна команда, не разбиваем на шаги
+    if re.search(r'найди\b.*\bоткрой\b.*\bпапк\w*\b', text, re.IGNORECASE):
+        return [text.strip(" ,.;")]
     parts = STEP_SEPARATOR_PATTERN.split(text)
     return [p.strip(" ,.;") for p in parts if p.strip(" ,.;")]
 
@@ -393,6 +407,12 @@ def parse_eva_command(text: str) -> EvaCommandParseResult:
             action="create_file", params={"path": filename_match.group(0), "content": content}, requires_confirmation=True,
         )
 
+    # --- Составная "найди и открой папку X" — ДО локального поиска,
+    # чтобы "найди" не съело всю фразу с плохим query ---
+    m = FIND_OPEN_FOLDER_PATTERN.search(text)
+    if m:
+        return EvaCommandParseResult(action="open_folder", params={"name": m.group(1).strip()}, requires_confirmation=False)
+
     # --- Поиск на устройстве: "найди файл X" / "найди папку X" /
     # "найди X на компьютере" — проверяем ДО веб-поиска, чтобы такие
     # фразы не улетали в браузер вместо реального поиска на диске.
@@ -409,6 +429,11 @@ def parse_eva_command(text: str) -> EvaCommandParseResult:
     m = OPEN_FILE_PATTERN.search(text)
     if m:
         return EvaCommandParseResult(action="open_file", params={"path": m.group(1).strip()}, requires_confirmation=False)
+
+    # --- Открытие папки (раньше общего "открой/запусти") ---
+    m = OPEN_FOLDER_PATTERN.search(text)
+    if m:
+        return EvaCommandParseResult(action="open_folder", params={"name": m.group(1).strip()}, requires_confirmation=False)
 
     if re.search(r'\b(прочитай|покажи)\b', normalized) and re.search(r'\bфайл\w*\b', normalized):
         filename_match = FILENAME_PATTERN.search(text)

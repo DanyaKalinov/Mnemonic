@@ -337,5 +337,41 @@ class TestLocalSearchRegressions(unittest.TestCase):
         self.assertEqual(r.params.get("engine"), "yandex")
 
 
+class TestOpenFolder(unittest.TestCase):
+    """Открытие папки по имени — «открой папку X», «покажи папку X» и
+    составные «найди и открой папку X» (регрессия на баг, когда такие фразы
+    уходили в open_app и искали программу вместо папки)."""
+
+    def test_open_folder_by_name(self):
+        r = parse_eva_command("открой папку Проекты")
+        self.assertEqual(r.action, "open_folder")
+        self.assertEqual(r.params["name"], "Проекты")
+
+    def test_open_folder_alias(self):
+        r = parse_eva_command("открой папку загрузки")
+        self.assertEqual(r.action, "open_folder")
+        self.assertEqual(r.params["name"], "загрузки")
+
+    def test_show_folder_alias(self):
+        r = parse_eva_command("покажи папку загрузки")
+        self.assertEqual(r.action, "open_folder")
+
+    def test_find_and_open_folder_is_single_step(self):
+        parts = split_into_subcommands("найди и открой папку Проекты")
+        self.assertEqual(parts, ["найди и открой папку Проекты"])
+        r = parse_eva_command(parts[0])
+        self.assertEqual(r.action, "open_folder")
+        self.assertEqual(r.params["name"], "Проекты")
+
+    def test_open_file_still_routes_to_file(self):
+        r = parse_eva_command("открой файл report.pdf")
+        self.assertEqual(r.action, "open_file")
+        self.assertEqual(r.params["path"], "report.pdf")
+
+    def test_open_folder_not_confused_with_app(self):
+        r = parse_eva_command("открой блокнот")
+        self.assertEqual(r.action, "open_app")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

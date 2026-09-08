@@ -14,6 +14,7 @@
 голос не может, например, удалить файл или выключить ПК без этого шага.
 """
 import json
+import re
 from typing import Awaitable, Callable
 
 from aiogram import Bot
@@ -25,6 +26,13 @@ from eva_agent_registry import push_command_to_agents
 from eva_command_parser import parse_eva_command, split_into_subcommands
 
 ReplyFunc = Callable[[str], Awaitable[None]]
+
+# Местоимения-указатели: если шаг целиком состоит из "открой её/его/это"
+# после шага search_file — заменяем на open_folder с тем же запросом.
+_PRONOUN_RE = re.compile(
+    r'^(?:открой(?:те)?|запусти|покажи)\s+(?:её|ее|его|это|ею|нее|неё|них|их)\s*$',
+    re.IGNORECASE,
+)
 
 
 async def _resolve_step(step_text: str):
@@ -60,6 +68,8 @@ def describe_eva_action(action: str, params: dict) -> str:
         return f"Ева закроет окно «{params.get('window')}» (несохранённые данные внутри могут быть потеряны)."
     if action == "open_file":
         return f"Ева откроет файл «{params.get('path', '?')}»."
+    if action == "open_folder":
+        return f"Ева откроет папку «{params.get('name', '?')}»."
     if action == "mouse_move":
         return f"Ева переместит курсор в ({params.get('x', '?')}, {params.get('y', '?')})."
     if action == "mouse_click":
@@ -99,8 +109,15 @@ async def process_eva_command(
     descriptions = []
     any_confirmation_needed = False
 
+    prev_action = None
+    prev_query = None
     for i, step_text in enumerate(step_texts, start=1):
-        action, params, requires_confirmation, error = await _resolve_step(step_text)
+        # "найди папку X и открой её" — вторая часть ссылается на результат
+        # первой (search_file). Превращаем её в open_folder с тем же запросом.
+        if prev_action == "search_file" and prev_query and _PRONOUN_RE.match(step_text.strip()):
+            action, params, requires_confirmation, error = "open_folder", {"name": prev_query}, False, None
+        else:
+            action, params, requires_confirmation, error = await _resolve_step(step_text)
         if error:
             prefix = f"Шаг {i} («{step_text}»): " if len(step_texts) > 1 else ""
             await reply(f"{prefix}{error}")
@@ -116,6 +133,9 @@ async def process_eva_command(
         steps.append({"action": action, "params": params})
         descriptions.append(describe_eva_action(action, params))
         any_confirmation_needed = any_confirmation_needed or requires_confirmation
+        prev_action = action
+        if action == "search_file":
+            prev_query = params.get("query")
 
     if not steps:
         return  # была только просьба узнать что-то в интернете — агенту отправлять нечего

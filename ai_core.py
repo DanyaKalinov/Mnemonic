@@ -162,6 +162,7 @@ _EVA_ACTIONS_SCHEMA = """
 - open_app: {"app": "название программы"}
 - open_website: {"url": "адрес сайта"}
 - open_file: {"path": "путь к файлу или папке"}
+- open_folder: {"name": "название папки, например 'загрузки' или 'Проекты'"}
 - create_file: {"path": "имя файла", "content": "текст"}
 - read_file: {"path": "имя файла"}
 - delete_file: {"path": "имя файла"}
