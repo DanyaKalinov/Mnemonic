@@ -133,7 +133,7 @@ async def on_startup(bot: Bot):
         secret_token=WEBHOOK_SECRET,
         drop_pending_updates=True,
     )
-    print(f"🚀 Бот Второй Мозг запущен, webhook: {webhook_url}", flush=True)
+    print(f"🚀 Бот Ева запущен, webhook: {webhook_url}", flush=True)
 
     # Диагностика: сверяем с тем, что Telegram реально видит у себя.
     # Если тут url пустой — проблема на стороне Telegram/токена, а не в коде.
