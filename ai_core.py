@@ -161,6 +161,7 @@ async def transcribe_voice(file_path: str) -> str:
 _EVA_ACTIONS_SCHEMA = """
 - open_app: {"app": "название программы"}
 - open_website: {"url": "адрес сайта"}
+- open_file: {"path": "путь к файлу или папке"}
 - create_file: {"path": "имя файла", "content": "текст"}
 - read_file: {"path": "имя файла"}
 - delete_file: {"path": "имя файла"}
@@ -180,13 +181,18 @@ _EVA_ACTIONS_SCHEMA = """
 - close_app: {"window": "название окна программы"}
 - minimize_window: {"window": "название окна программы"}
 - maximize_window: {"window": "название окна программы"}
+- mouse_move: {"x": "координата по горизонтали", "y": "координата по вертикали"}
+- mouse_click: {"x": "координата по горизонтали", "y": "координата по вертикали", "button": "left/right/middle (необязательно)"}
+- mouse_scroll: {"direction": "up или down", "amount": "сколько щелчков колеса (необязательно)"}
+- mouse_drag: {"x_start": "начальная x", "y_start": "начальная y", "x_end": "конечная x", "y_end": "конечная y"}
+- set_default_browser: {"browser": "chrome/opera/firefox/edge/yandex_browser"}
 - ui_type_text: {"window": "название окна программы", "control": "название поля ввода", "text": "что напечатать"}
 - ask_web: {"query": "вопрос, на который нужен АКТУАЛЬНЫЙ ответ из интернета текстом (не открытие браузера, а именно текстовый ответ)"}
 """
 
 # Действия, которые меняют/удаляют данные или влияют на работу ПК целиком —
 # для них ВСЕГДА нужно подтверждение, даже если модель сама так не подумала.
-_DESTRUCTIVE_ACTIONS = {"create_file", "delete_file", "edit_file", "copy_file", "move_file", "power_action", "close_app"}
+_DESTRUCTIVE_ACTIONS = {"create_file", "delete_file", "edit_file", "copy_file", "move_file", "power_action", "close_app", "mouse_click", "mouse_drag"}
 
 
 async def interpret_eva_command(text: str) -> dict:

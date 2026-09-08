@@ -23,6 +23,7 @@ DEFAULT_COMMANDS = [
 BASE_COMMANDS = DEFAULT_COMMANDS + [
     BotCommand(command="status", description="Мой уровень доступа"),
     BotCommand(command="memory", description="Последние записи в памяти"),
+    BotCommand(command="digest", description="Дайджест памяти за сутки"),
     BotCommand(command="reminders", description="Список напоминаний"),
     BotCommand(command="timezone", description="Настроить часовой пояс"),
     BotCommand(command="eva_request", description="Запросить доступ к Еве"),
@@ -31,6 +32,7 @@ BASE_COMMANDS = DEFAULT_COMMANDS + [
 # Добавляется тем, у кого есть доступ к Еве (owner или eva_access=granted)
 EVA_COMMANDS = [
     BotCommand(command="eva", description="Отдать команду Еве"),
+    BotCommand(command="dashboard", description="Панель управления Евой"),
     BotCommand(command="agent_status", description="Подключён ли агент Евы"),
 ]
 

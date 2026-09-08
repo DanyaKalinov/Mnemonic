@@ -58,6 +58,20 @@ def describe_eva_action(action: str, params: dict) -> str:
         return f"Ева {labels.get(params.get('action'), 'выполнит действие с питанием ПК')}."
     if action == "close_app":
         return f"Ева закроет окно «{params.get('window')}» (несохранённые данные внутри могут быть потеряны)."
+    if action == "open_file":
+        return f"Ева откроет файл «{params.get('path', '?')}»."
+    if action == "mouse_move":
+        return f"Ева переместит курсор в ({params.get('x', '?')}, {params.get('y', '?')})."
+    if action == "mouse_click":
+        label = {"left": "левой", "right": "правой", "middle": "средней"}.get(params.get("button"), params.get("button", "?"))
+        return f"Ева кликнет {label} кнопкой мыши в ({params.get('x', '?')}, {params.get('y', '?')})."
+    if action == "mouse_scroll":
+        return f"Ева прокрутит {params.get('direction', '?')} на {params.get('amount', '?')}."
+    if action == "mouse_drag":
+        return (f"Ева перетащит элемент мышью из ({params.get('x_start', '?')}, {params.get('y_start', '?')}) "
+                f"в ({params.get('x_end', '?')}, {params.get('y_end', '?')}).")
+    if action == "set_default_browser":
+        return f"Ева будет открывать сайты и поиск в браузере «{params.get('browser', '?')}»."
     return "Это действие изменит данные или состояние ПК."
 
 

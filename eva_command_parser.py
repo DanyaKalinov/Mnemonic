@@ -10,6 +10,7 @@
 Поддерживаемые действия:
 - open_app      — «открой блокнот», «запусти калькулятор»
 - open_website  — «открой сайт youtube.com», «зайди на ютуб.com»
+- open_file     — «открой файл report.pdf», «открой документ notes.txt»
 - create_file   — «создай файл notes.txt с текстом купить молоко»
 - read_file     — «прочитай файл notes.txt»
 - delete_file   — «удали файл notes.txt»                    [подтверждение]
@@ -86,6 +87,11 @@ VOLUME_UNMUTE_PATTERN = re.compile(r'включи\s+звук', re.IGNORECASE)
 VOLUME_UP_PATTERN = re.compile(r'\bгромче\b|прибавь\s+звук|звук\s+погромче', re.IGNORECASE)
 VOLUME_DOWN_PATTERN = re.compile(r'\bтише\b|убавь\s+звук|звук\s+потише', re.IGNORECASE)
 
+# ----- Открытие файла (проверяется раньше общего "открой/запусти") -----
+OPEN_FILE_PATTERN = re.compile(
+    r'(?:открой|откройте|открыть|запусти)\s+(?:файл|документ)\s+(.+)$', re.IGNORECASE,
+)
+
 # ----- Сайты (проверяются раньше общего "открой", т.к. тоже используют это слово) -----
 OPEN_SITE_PATTERN = re.compile(r'(?:открой|зайди на|перейди на)\s+сайт\s+(.+)$', re.IGNORECASE)
 OPEN_SITE_DOMAIN_PATTERN = re.compile(
@@ -126,6 +132,24 @@ MAXIMIZE_WINDOW_PATTERN = re.compile(r'разверни\s+(.+)$', re.IGNORECASE)
 
 PRESS_KEY_PATTERN = re.compile(r'нажми\s+(.+)$', re.IGNORECASE)
 
+# ----- Управление мышью -----
+MOUSE_MOVE_PATTERN = re.compile(
+    r'(?:перемести|двигай)\s+(?:курсор|мышь|указатель)\s+(?:на\s+)?(\d+)\s+(\d+)', re.IGNORECASE,
+)
+MOUSE_CLICK_PATTERN = re.compile(
+    r'(?:нажми|кликни|тыкни)\s+'
+    r'(?:(левой|правой|средней)\s+кнопкой(?:\s+мыши)?|кнопкой\s+(левой|правой|средней)\s+мыши|мышью|курсором|кнопкой)?'
+    r'\s*(?:на\s+)?(\d+)\s+(\d+)',
+    re.IGNORECASE,
+)
+MOUSE_SCROLL_PATTERN = re.compile(
+    r'(?:прокрути|скролль)\s+(?:на\s+)?(вверх|вниз)\s*(\d+)?', re.IGNORECASE,
+)
+MOUSE_DRAG_PATTERN = re.compile(
+    r'(?:перетащи|перемести)\s+(?:мышью|курсором)?\s*(?:из\s+)?(\d+)\s+(\d+)\s+(?:в|на)\s+(\d+)\s+(\d+)',
+    re.IGNORECASE,
+)
+
 # ----- Актуальный ответ из интернета текстом (не открытие браузера) -----
 ASK_WEB_PATTERN = re.compile(
     r'\bузнай\b\s+(.+)$|актуальн\w*\s+(?:информаци\w*|новост\w*)\s*(?:о|про)?\s*(.+)$',
@@ -150,6 +174,12 @@ SEARCH_BROWSER_PATTERNS = {
 }
 _SEARCH_STOPWORDS = re.compile(r'\b(?:информацию|инфу|про|об?|в|через|на|интернете?)\b', re.IGNORECASE)
 
+
+# ----- Браузер по умолчанию -----
+SET_BROWSER_PATTERN = re.compile(
+    r'(?:установи|поставь|измени|смени)\s+(?:браузер\s+)?(?:по\s+умолчанию\s+)?(?:на\s+)?([\w\s-]+?)\s*$',
+    re.IGNORECASE,
+)
 
 # ----- Поиск на устройстве: "найди файл X" / "найди папку X" /
 # "найди X на компьютере/пк/диске" -----
@@ -263,6 +293,14 @@ def parse_eva_command(text: str) -> EvaCommandParseResult:
             return EvaCommandParseResult(error="⚠️ Уточни, о чём именно узнать.")
         return EvaCommandParseResult(action="ask_web", params={"query": query}, requires_confirmation=False)
 
+    # --- Браузер по умолчанию ---
+    m = SET_BROWSER_PATTERN.search(text)
+    if m:
+        browser = m.group(1).strip().rstrip(".")
+        if not browser:
+            return EvaCommandParseResult(error="⚠️ Какой браузер поставить по умолчанию?")
+        return EvaCommandParseResult(action="set_default_browser", params={"browser": browser}, requires_confirmation=False)
+
     # --- Питание ПК (проверяем раньше всего — явные, узкие фразы) ---
     if POWER_SHUTDOWN.search(normalized):
         return EvaCommandParseResult(action="power_action", params={"action": "shutdown"}, requires_confirmation=True)
@@ -367,11 +405,46 @@ def parse_eva_command(text: str) -> EvaCommandParseResult:
     if web_search_result is not None:
         return web_search_result
 
-    if re.search(r'\b(прочитай|покажи|открой)\b', normalized) and re.search(r'\bфайл\w*\b', normalized):
+    # --- Открытие файла (раньше read_file и общего "открой/запусти") ---
+    m = OPEN_FILE_PATTERN.search(text)
+    if m:
+        return EvaCommandParseResult(action="open_file", params={"path": m.group(1).strip()}, requires_confirmation=False)
+
+    if re.search(r'\b(прочитай|покажи)\b', normalized) and re.search(r'\bфайл\w*\b', normalized):
         filename_match = FILENAME_PATTERN.search(text)
         if not filename_match:
             return EvaCommandParseResult(error=NO_FILENAME_ERROR)
         return EvaCommandParseResult(action="read_file", params={"path": filename_match.group(0)}, requires_confirmation=False)
+
+    # --- Управление мышью ---
+    m = MOUSE_DRAG_PATTERN.search(text)
+    if m:
+        return EvaCommandParseResult(
+            action="mouse_drag",
+            params={"x_start": int(m.group(1)), "y_start": int(m.group(2)), "x_end": int(m.group(3)), "y_end": int(m.group(4))},
+            requires_confirmation=False,
+        )
+    m = MOUSE_MOVE_PATTERN.search(text)
+    if m:
+        return EvaCommandParseResult(
+            action="mouse_move", params={"x": int(m.group(1)), "y": int(m.group(2))}, requires_confirmation=False,
+        )
+    m = MOUSE_CLICK_PATTERN.search(text)
+    if m:
+        button_word = (m.group(1) or m.group(2) or "левой").lower()
+        button_map = {"левой": "left", "правой": "right", "средней": "middle"}
+        button = button_map.get(button_word, "left")
+        return EvaCommandParseResult(
+            action="mouse_click", params={"x": int(m.group(3)), "y": int(m.group(4)), "button": button},
+            requires_confirmation=False,
+        )
+    m = MOUSE_SCROLL_PATTERN.search(text)
+    if m:
+        direction = m.group(1).lower()
+        amount = int(m.group(2)) if m.group(2) else 3
+        return EvaCommandParseResult(
+            action="mouse_scroll", params={"direction": direction, "amount": amount}, requires_confirmation=False,
+        )
 
     # --- Печать текста / горячие клавиши / клик по кнопке (ДО общего "открой") ---
     # Явно исключаем случаи со словом "файл" — это почти всегда относится

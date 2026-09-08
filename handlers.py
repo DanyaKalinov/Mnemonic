@@ -1,6 +1,7 @@
 import asyncio
 import os
 import tempfile
+from datetime import datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 from aiogram import Router, types
@@ -17,14 +18,14 @@ from config import ADMIN_ID
 from db import (
     add_user, user_exists, get_user, set_user_status, update_user_settings,
     add_reminder, get_user_reminders, snooze_reminder, delete_reminder,
-    get_user_memories, delete_memory,
+    get_user_memories, delete_memory, get_recent_memories,
     list_users, get_stats,
     set_user_role, is_owner, get_eva_command, update_eva_command_status,
     can_use_eva, set_eva_access, list_owner_ids, list_eva_access_users,
 )
 from reminder_parser import parse_reminder_text
 from memory import add_memory
-from ai_core import get_ai_response, describe_image, transcribe_voice
+from ai_core import get_ai_response, describe_image, transcribe_voice, summarize_for_digest
 from eva_agent_registry import is_agent_connected, push_command_to_agents
 from eva_engine import process_eva_command
 from bot_commands import sync_commands_for_user
@@ -34,6 +35,35 @@ load_dotenv()
 # а не при каждом сообщении с локацией.
 _tz_finder = TimezoneFinder()
 router = Router()
+
+# ----- Состояние ожидания ввода для Dashboard -----
+# Когда пользователь нажал на кнопку панели, которой нужен текст-параметр
+# (например «Открыть файл»), мы запоминаем тут, что от него ждём следующее
+# сообщение. handle_text сверяет этот словарь ДО обычной обработки и
+# превращает введённый текст в команду Еве. Хранится в памяти процесса —
+# потеряется при рестарте бота, для этого сценария это нормально.
+_pending_dashboard_input: dict[int, str] = {}
+
+# Кнопки с мгновенным действием: callback-суффикс -> текст команды Еве
+_DASHBOARD_DIRECT = {
+    "screenshot": "сделай скриншот",
+    "vol_up": "сделай громче",
+    "vol_down": "сделай тише",
+    "vol_mute": "выключи звук",
+    "list_files": "покажи файлы в загрузках",
+    "power_lock": "заблокируй компьютер",
+    "power_shutdown": "выключи компьютер",
+}
+
+# Кнопки, которым нужен ввод: callback-суффикс -> (текст-подсказка, шаблон команды).
+# {input} в шаблоне заменится на то, что пользователь напишет следующим сообщением.
+_DASHBOARD_INPUT = {
+    "open_file": ("📄 Что открыть? Напиши путь или имя файла.", "открой файл {input}"),
+    "search_file": ("🔍 Что найти на компьютере? Напиши название файла.", "найди файл {input}"),
+    "open_website": ("🌐 Какой сайт открыть? Напиши адрес, например youtube.com.", "открой сайт {input}"),
+    "web_search": ("🔎 Что найти в интернете?", "найди в интернете {input}"),
+    "type_text": ("⌨️ Что напечатать в активном окне?", "напиши {input}"),
+}
 
 # ----- Текст с текущим уровнем доступа (боту / полным функциям Евы) -----
 def _eva_access_line(user: dict) -> str:
@@ -334,6 +364,41 @@ async def handle_delete_memory(callback: CallbackQuery):
         await callback.message.edit_text("⚠️ Запись уже удалена или не найдена.")
     await callback.answer()
 
+# ----- Команда /digest — дайджест памяти по запросу -----
+# В отличие от ежедневного автодайджеста (main.py send_daily_digest), тут
+# пользователь сам просит сжатое саммари своих записей за последние сутки.
+@router.message(Command("digest"))
+async def cmd_digest(message: Message):
+    user_id = message.from_user.id
+    user = await get_user(user_id)
+    tz_name = ((user["settings"] if user else {}) or {}).get("timezone") or "UTC"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+
+    entries = await get_recent_memories(user_id, hours=24)
+    if not entries:
+        await message.answer("📭 За последние сутки у тебя не было записей в памяти — дайджест составлять не из чего.")
+        return
+
+    digest_entries = [
+        {
+            "text": e["text"],
+            "created_at_local": e["created_at"].astimezone(tz).strftime("%d.%m.%Y %H:%M"),
+        }
+        for e in entries
+    ]
+    today_str = datetime.now(timezone.utc).astimezone(tz).strftime("%d.%m.%Y")
+
+    await message.answer("🧠 Собираю дайджест за сутки...")
+    summary = await summarize_for_digest(digest_entries, today_str)
+    if not summary:
+        await message.answer("😵 Не смог составить дайджест — попробуй ещё раз чуть позже.")
+        return
+    await message.answer(f"📰 Дайджест за сутки:\n\n{summary}")
+
+
 # ----- Админ: /users -----
 @router.message(Command("users"))
 async def cmd_users(message: Message):
@@ -569,14 +634,92 @@ async def handle_eva_command_confirmation(callback: CallbackQuery):
         await callback.message.edit_text(callback.message.text + "\n\n❌ Отменено.")
     await callback.answer()
 
+# ----- Dashboard: панель быстрых действий Евы -----
+def _dashboard_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📸 Скриншот", callback_data="dash:screenshot"),
+            InlineKeyboardButton(text="🔊 Громче", callback_data="dash:vol_up"),
+            InlineKeyboardButton(text="🔉 Тише", callback_data="dash:vol_down"),
+        ],
+        [
+            InlineKeyboardButton(text="🔇 Звук", callback_data="dash:vol_mute"),
+            InlineKeyboardButton(text="📁 Файлы", callback_data="dash:list_files"),
+            InlineKeyboardButton(text="🔍 Найти файл", callback_data="dash:input:search_file"),
+        ],
+        [
+            InlineKeyboardButton(text="📄 Открыть файл", callback_data="dash:input:open_file"),
+            InlineKeyboardButton(text="🌐 Сайт", callback_data="dash:input:open_website"),
+            InlineKeyboardButton(text="🔎 Поиск", callback_data="dash:input:web_search"),
+        ],
+        [
+            InlineKeyboardButton(text="⌨️ Напечатать", callback_data="dash:input:type_text"),
+            InlineKeyboardButton(text="🔒 Блокировка", callback_data="dash:power_lock"),
+            InlineKeyboardButton(text="🔌 Выключить", callback_data="dash:power_shutdown"),
+        ],
+    ])
+
+
+@router.message(Command("dashboard"))
+async def cmd_dashboard(message: Message):
+    if not await can_use_eva(message.from_user.id):
+        await message.answer("⛔ У тебя нет доступа к Еве. Запросить: /eva_request")
+        return
+    await message.answer("📋 Панель управления Евой:", reply_markup=_dashboard_keyboard())
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("dash:"))
+async def handle_dashboard(callback: CallbackQuery):
+    if not await can_use_eva(callback.from_user.id):
+        await callback.answer("⛔ У тебя нет доступа к Еве.", show_alert=True)
+        return
+
+    action = callback.data[len("dash:"):]  # убираем префикс "dash:"
+
+    # Кнопка с вводом параметра — просим пользователя написать значение
+    if action.startswith("input:"):
+        input_type = action[len("input:"):]
+        prompt, _ = _DASHBOARD_INPUT[input_type]
+        _pending_dashboard_input[callback.from_user.id] = input_type
+        await callback.message.answer(prompt)
+        await callback.answer()
+        return
+
+    # Мгновенное действие — уходит Еве напрямую
+    command_text = _DASHBOARD_DIRECT.get(action)
+    if not command_text:
+        await callback.answer("Неизвестная кнопка.", show_alert=True)
+        return
+
+    await callback.answer()
+    await process_eva_command(
+        callback.bot, callback.from_user.id, command_text, callback.message.answer
+    )
+
+
 # ----- Обработка текста (запоминание + AI-ответ) -----
 @router.message(lambda msg: msg.text is not None)
 async def handle_text(message: Message):
+    user_id = message.from_user.id
+
+    # Если мы ждём от пользователя параметр для кнопки панели — берём это
+    # сообщение как значение, не сохраняем его в память и не отвечаем ИИ.
+    pending_input = _pending_dashboard_input.pop(user_id, None)
+    if pending_input:
+        if message.text.startswith('/'):
+            # Пользователь передумал / прислал команду — отменяем ожидание
+            _pending_dashboard_input.pop(user_id, None)
+            await message.answer("❌ Действие отменено — ожидание ввода сброшено.")
+            return
+        _, template = _DASHBOARD_INPUT[pending_input]
+        command_text = template.format(input=message.text.strip())
+        await process_eva_command(message.bot, user_id, command_text, message.answer)
+        return
+
     if message.text.startswith('/'):
         await message.answer("❓ Неизвестная команда. Напиши /help.")
         return
 
-    user_id = message.from_user.id
     user_text = message.text
 
     lower_text = user_text.lower()
