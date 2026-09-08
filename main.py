@@ -148,7 +148,20 @@ async def on_startup(bot: Bot):
     # Плюс сразу выставляем полное меню для ADMIN_ID — он же owner с бутстрапа.
     # Для остальных пользователей персональное меню выставляется в момент
     # их /start и при выдаче/отзыве доступа к Еве (см. handlers.py).
+    #
+    # Дополнительно на старте обновляем меню ВСЕМ одобренным пользователям:
+    # так новые команды (например /screenshot, /find, /open) появляются у них
+    # в меню сразу после деплоя, не дожидаясь их следующего /start.
     await set_default_commands(bot)
+    approved_ids = await list_approved_users()
+    for uid in approved_ids:
+        try:
+            user = await get_user(uid)
+            await sync_commands_for_user(bot, uid, user)
+        except Exception as e:
+            print(f"⚠️ Не удалось обновить меню команд для {uid}: {e}", flush=True)
+    # На всякий случай дублируем админа (он мог быть не в списке одобренных,
+    # например на бутстрапе роль ещё не выставлена).
     admin_user = await get_user(ADMIN_ID)
     await sync_commands_for_user(bot, ADMIN_ID, admin_user)
 

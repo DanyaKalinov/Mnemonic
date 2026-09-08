@@ -241,7 +241,8 @@ async def cmd_help(message: Message):
         "📊 /status — Проверить уровень доступа (бот / Ева)\n"
         "📋 /reminders — Список активных напоминаний (можно отменять)\n"
         "🌍 /timezone — Настроить часовой пояс по геолокации\n"
-        "🗂 /memory — Последние записи в памяти (можно удалять)\n\n"
+        "🗂 /memory — Последние записи в памяти (можно удалять)\n"
+        "📰 /digest — Дайджест памяти за сутки\n\n"
         "🧠 **Просто напиши текст** — я запомню его\n"
         "🔎 **Задай вопрос** — я найду ответ среди твоих записей\n"
         "📄 **Отправь PDF** — я прочитаю и запомню его содержание\n"
@@ -266,6 +267,10 @@ async def cmd_help(message: Message):
         help_text += (
             "\n\n🤖 **Команды Евы (владелец):**\n"
             "🎛 /eva <команда> — Отдать команду desktop-агенту\n"
+            "📸 /screenshot — Сделать скриншот экрана\n"
+            "🔍 /find <что> — Найти файл или папку на компьютере\n"
+            "📂 /open <путь> — Открыть файл или папку\n"
+            "🎛 /dashboard — Панель управления Евой (кнопки)\n"
             "📡 /agent_status — Подключён ли desktop-агент\n"
             "👥 /eva_users — Кто имеет доступ к Еве\n"
             "🚫 /eva_revoke <id> — Отозвать доступ к Еве"
@@ -274,6 +279,10 @@ async def cmd_help(message: Message):
         help_text += (
             "\n\n🤖 **Ева (доступ выдан):**\n"
             "🎛 /eva <команда> — Отдать команду desktop-агенту\n"
+            "📸 /screenshot — Сделать скриншот экрана\n"
+            "🔍 /find <что> — Найти файл или папку на компьютере\n"
+            "📂 /open <путь> — Открыть файл или папку\n"
+            "🎛 /dashboard — Панель управления Евой (кнопки)\n"
             "📡 /agent_status — Подключён ли desktop-агент"
         )
     else:
@@ -569,6 +578,47 @@ async def cmd_agent_status(message: Message):
 # (Разбор шагов команды теперь в eva_engine._resolve_step)
 
 
+@router.message(Command("screenshot"))
+async def cmd_screenshot(message: Message):
+    """Быстрая команда: /screenshot — сделать скриншот экрана."""
+    if not await can_use_eva(message.from_user.id):
+        await message.answer("⛔ У тебя нет доступа к Еве. Запросить: /eva_request")
+        return
+    await process_eva_command(message.bot, message.from_user.id, "сделай скриншот", message.answer)
+
+
+@router.message(Command("find"))
+async def cmd_find(message: Message):
+    """Быстрая команда: /find отчёт — найти файл или папку на компьютере."""
+    if not await can_use_eva(message.from_user.id):
+        await message.answer("⛔ У тебя нет доступа к Еве. Запросить: /eva_request")
+        return
+    query = message.text.partition(" ")[2].strip()
+    if not query:
+        await message.answer("Укажи что искать: /find отчёт")
+        return
+    await process_eva_command(message.bot, message.from_user.id, f"найди файл {query}", message.answer)
+
+
+@router.message(Command("open"))
+async def cmd_open(message: Message):
+    """Быстрая команда: /open report.pdf — открыть файл или папку."""
+    if not await can_use_eva(message.from_user.id):
+        await message.answer("⛔ У тебя нет доступа к Еве. Запросить: /eva_request")
+        return
+    path = message.text.partition(" ")[2].strip()
+    if not path:
+        await message.answer("Укажи путь: /open файл report.pdf или /open папку загрузки")
+        return
+    # Если пользователь уже указал тип («файл …»/«папку …») — передаём как есть,
+    # иначе добавляем «файл» — open_file сам разберётся и с путём, и с псевдонимом
+    # папки (например «загрузки»), и с именем в кавычках.
+    if path.lower().startswith(("файл", "папк")):
+        await process_eva_command(message.bot, message.from_user.id, f"открой {path}", message.answer)
+    else:
+        await process_eva_command(message.bot, message.from_user.id, f"открой файл {path}", message.answer)
+
+
 @router.message(Command("eva"))
 async def cmd_eva(message: Message):
     if not await can_use_eva(message.from_user.id):
@@ -585,6 +635,8 @@ async def cmd_eva(message: Message):
             "• /eva создай файл notes.txt с текстом купить молоко\n"
             "• /eva прочитай файл notes.txt\n"
             "• /eva удали файл notes.txt\n"
+            "• /eva открой папку загрузки\n"
+            "• /eva найди и открой папку Проекты\n"
             "• /eva сделай скриншот\n"
             "• /eva покажи файлы в загрузках\n"
             "• /eva найди файл отчёт\n"
@@ -592,6 +644,10 @@ async def cmd_eva(message: Message):
             "• /eva заблокируй компьютер\n"
             "• /eva напиши купить молоко\n"
             "• /eva нажми ctrl+s\n"
+            "• /eva перемести курсор на 500 300\n"
+            "• /eva кликни мышью в 100 200\n"
+            "• /eva прокрути вниз\n"
+            "• /eva установи браузер по умолчанию opera\n"
             "• /eva найди в яндексе погода через оперу\n"
             "• /eva узнай курс доллара сегодня\n"
             "• /eva нажми кнопку сохранить в окне блокнот\n\n"

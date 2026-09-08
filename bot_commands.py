@@ -31,7 +31,10 @@ BASE_COMMANDS = DEFAULT_COMMANDS + [
 
 # Добавляется тем, у кого есть доступ к Еве (owner или eva_access=granted)
 EVA_COMMANDS = [
-    BotCommand(command="eva", description="Отдать команду Еве"),
+    BotCommand(command="eva", description="Отдать команду Еве (файлы, сайты, ПК)"),
+    BotCommand(command="screenshot", description="Сделать скриншот экрана"),
+    BotCommand(command="find", description="Найти файл или папку на компьютере"),
+    BotCommand(command="open", description="Открыть файл или папку"),
     BotCommand(command="dashboard", description="Панель управления Евой"),
     BotCommand(command="agent_status", description="Подключён ли агент Евы"),
 ]
