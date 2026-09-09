@@ -30,10 +30,12 @@ from aiogram.types import BufferedInputFile
 from aiohttp import web, WSMsgType
 
 from config import EVA_AGENT_SECRET
+import chat_state
 from db import get_pending_eva_commands, update_eva_command_status, get_eva_command, can_use_eva
 from eva_agent_registry import (
     register_agent, unregister_agent, push_command_to_agents, get_owner_id_for_agent,
 )
+from memory import search_memory
 
 
 async def eva_ws_handler(request: web.Request) -> web.WebSocketResponse:
@@ -101,6 +103,26 @@ async def _handle_agent_message(raw: str, bot: Bot, agent_id: str, ws: web.WebSo
     elif msg_type == "cloud_action":
         from eva_engine import handle_cloud_action
         await handle_cloud_action(ws, agent_id, data)
+    elif msg_type == "chat":
+        text = data.get("text", "")
+        from chat_state import new_message_id
+        import eva_engine
+        owner_id = get_owner_id_for_agent(agent_id)
+        if owner_id is not None:
+            message_id = new_message_id()
+            eva_engine.chat_state.register_message(message_id, owner_id, "app", text)
+            memories = await search_memory(owner_id, text, k=5)
+            await ws.send_str(
+                json.dumps(
+                    {
+                        "type": "chat",
+                        "message_id": message_id,
+                        "text": text,
+                        "origin": "app",
+                        "memory": memories,
+                    }
+                )
+            )
     # неизвестные типы просто игнорируем — вперёд совместимость
 
 
@@ -137,11 +159,6 @@ async def _handle_result_message(data: dict, bot: Bot) -> None:
             )
     except Exception as e:
         print(f"⚠️ Не удалось уведомить о результате команды {command_id}: {e}", flush=True)
-
-    # Если команда изначально пришла из приложения (агент запросил подтверждение),
-    # продублировать итог в чат приложения.
-    from eva_agent_registry import notify_app
-    await notify_app(command["requested_by"], "eva", f"{icon} {result or 'готово'}")
 
 
 async def _handle_voice_command_message(data: dict, bot: Bot, agent_id: str) -> None:
