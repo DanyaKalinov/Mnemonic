@@ -320,3 +320,64 @@ async def ask_web(query: str) -> str:
     except Exception as e:
         print(f"❌ Ошибка синтеза ответа Gemini (ask_web): {e}")
         return "😵 Нашёл результаты поиска, но не смог сформулировать ответ (ошибка Gemini)."
+
+
+def _tavily_search(query: str, max_results: int = 5) -> str:
+    """Сырой поиск Tavily → текстовые сниппеты. БЕЗ генерации Gemini —
+    сырьё уходит локальному мозгу, текст формулирует он."""
+    if not TAVILY_API_KEY:
+        return "⚠️ Не настроен ключ Tavily (TAVILY_API_KEY)."
+    response = requests.post(
+        "https://api.tavily.com/search",
+        json={"api_key": TAVILY_API_KEY, "query": query,
+              "search_depth": "basic", "max_results": max_results},
+        timeout=15,
+    )
+    response.raise_for_status()
+    results = response.json().get("results", [])
+    if not results:
+        return "Не нашёл ничего по этому запросу."
+    return "\n\n".join(
+        f"Источник: {r.get('url','')}\n{(r.get('content') or '')[:800]}" for r in results[:5]
+    )
+
+
+async def tavily_search_snippets(query: str) -> str:
+    try:
+        return await asyncio.to_thread(_tavily_search, query)
+    except Exception as e:
+        print(f"❌ Ошибка Tavily (сырой поиск): {e}")
+        return "😵 Не смог найти информацию в интернете (ошибка поискового сервиса)."
+
+
+async def fetch_url_text(url: str) -> str:
+    """Текст страницы по ссылке (HTML → Markdown). Для чтения статьи локальным мозгом."""
+    import html2text
+    def _fetch() -> str:
+        response = requests.get(url, timeout=20, headers={"User-Agent": "EvaBot/1.0"})
+        response.raise_for_status()
+        return html2text.html2text(response.text)[:6000]
+    try:
+        return await asyncio.to_thread(_fetch)
+    except Exception as e:
+        print(f"❌ Ошибка чтения URL {url}: {e}")
+        return "😵 Не смог прочитать страницу по этой ссылке."
+
+
+async def normalize_reminder_text(raw: str) -> str:
+    """Gemini причёсывает текст напоминания (коротко и по делу). При сбое —
+    исходный текст."""
+    if not GOOGLE_API_KEY or not raw.strip():
+        return raw.strip()
+    prompt = (
+        "Перепиши текст напоминания коротко и по делу, одним предложением, "
+        "на русском. Без слова 'напомни' и без дат/времени в тексте (они "
+        f"считаются отдельно). Текст: «{raw}»"
+    )
+    try:
+        response = await asyncio.to_thread(
+            client.models.generate_content, model="gemini-flash-lite-latest", contents=[prompt]
+        )
+        return (response.text or "").strip() or raw.strip()
+    except Exception:
+        return raw.strip()

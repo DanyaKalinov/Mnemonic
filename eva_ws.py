@@ -100,7 +100,7 @@ async def _handle_agent_message(raw: str, bot: Bot, agent_id: str, ws: web.WebSo
         await handle_confirm_request(bot, agent_id, data)
     elif msg_type == "cloud_action":
         from eva_engine import handle_cloud_action
-        await handle_cloud_action(ws, data)
+        await handle_cloud_action(ws, agent_id, data)
     # неизвестные типы просто игнорируем — вперёд совместимость
 
 

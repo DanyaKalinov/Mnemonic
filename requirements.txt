@@ -9,3 +9,4 @@ requests
 dateparser
 timezonefinder
 groq
+html2text

@@ -303,7 +303,7 @@ async def handle_confirm_request(bot: Bot, agent_id: str, data: dict) -> None:
     await bot.send_message(owner_id, f"{body}\nПодтверди выполнение:", reply_markup=keyboard)
 
 
-async def handle_cloud_action(ws, data: dict) -> None:
+async def handle_cloud_action(ws, agent_id: str, data: dict) -> None:
     """Облачное действие локального мозга. Исполняется на сервере,
     результат возвращается агенту как cloud_result (синтез ответа — агент)."""
     request_id = data.get("request_id")
@@ -311,11 +311,15 @@ async def handle_cloud_action(ws, data: dict) -> None:
     params = data.get("params") or {}
     if not request_id or not action:
         return
-    try:
-        from cloud_actions import execute_cloud_action
-        result = await execute_cloud_action(action, params)
-    except ImportError:
-        result = {"status": "error", "result": "cloud_actions not ready"}
+
+    from eva_agent_registry import get_owner_id_for_agent
+    user_id = get_owner_id_for_agent(agent_id)
+    if user_id is None:
+        user_id = 0  # fallback
+
+    from cloud_actions import execute_cloud_action
+    result = await execute_cloud_action(action, params, user_id)
+
     payload = {"type": "cloud_result", "request_id": request_id, **result}
     try:
         await ws.send_str(json.dumps(payload))
