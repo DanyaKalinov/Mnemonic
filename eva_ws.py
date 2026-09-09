@@ -69,7 +69,7 @@ async def eva_ws_handler(request: web.Request) -> web.WebSocketResponse:
     try:
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
-                await _handle_agent_message(msg.data, bot, agent_id)
+                await _handle_agent_message(msg.data, bot, agent_id, ws)
             elif msg.type == WSMsgType.ERROR:
                 print(f"⚠️ Ошибка WS-соединения с агентом {agent_id}: {ws.exception()}", flush=True)
     finally:
@@ -79,7 +79,7 @@ async def eva_ws_handler(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
-async def _handle_agent_message(raw: str, bot: Bot, agent_id: str) -> None:
+async def _handle_agent_message(raw: str, bot: Bot, agent_id: str, ws: web.WebSocketResponse) -> None:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -92,6 +92,15 @@ async def _handle_agent_message(raw: str, bot: Bot, agent_id: str) -> None:
         await _handle_result_message(data, bot)
     elif msg_type == "voice_command":
         await _handle_voice_command_message(data, bot, agent_id)
+    elif msg_type == "chat_result":
+        from eva_engine import handle_chat_result
+        await handle_chat_result(bot, data)
+    elif msg_type == "confirm_request":
+        from eva_engine import handle_confirm_request
+        await handle_confirm_request(bot, agent_id, data)
+    elif msg_type == "cloud_action":
+        from eva_engine import handle_cloud_action
+        await handle_cloud_action(ws, data)
     # неизвестные типы просто игнорируем — вперёд совместимость
 
 

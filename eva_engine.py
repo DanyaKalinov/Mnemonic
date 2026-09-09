@@ -24,7 +24,8 @@ from ai_core import interpret_eva_command, ask_web
 from db import add_eva_command
 from eva_agent_registry import push_command_to_agents, get_user_agent, send_to_user_agent, speak_to_owner
 from eva_command_parser import parse_eva_command, split_into_subcommands
-from chat_state import new_message_id, register_message, get_message as chat_state_get_message
+import chat_state
+from chat_state import new_message_id, register_message
 from memory import search_memory
 
 ReplyFunc = Callable[[str], Awaitable[None]]
@@ -229,3 +230,94 @@ async def process_eva_command(
     # Для голоса ничего дополнительно не отвечаем здесь — результат придёт
     # позже через WS "result", агент сам озвучит его локально (ws_client.py),
     # и он всё равно уйдёт в Telegram как обычно (eva_ws._handle_agent_message).
+
+
+# ---------------------------------------------------------------------------
+# Обратная доставка от агента — chat_result / confirm_request / cloud_action
+# ---------------------------------------------------------------------------
+
+async def _deliver_text(bot: Bot, user_id: int, text: str, image_base64: Optional[str] = None) -> None:
+    """Отправляет итог чата пользователю в Telegram (единая точка для
+    chat_result) — для голоса дополнительно озвучиваем через агента."""
+    from aiogram.types import BufferedInputFile
+    try:
+        if image_base64:
+            import base64
+            photo = BufferedInputFile(base64.b64decode(image_base64), filename="screenshot.png")
+            await bot.send_photo(user_id, photo=photo, caption=text or "Ева")
+        else:
+            await bot.send_message(user_id, text or "Ева")
+    except Exception as e:
+        print(f"⚠️ Не удалось доставить chat_result пользователю {user_id}: {e}", flush=True)
+
+
+async def handle_chat_result(bot: Bot, data: dict) -> None:
+    message_id = data.get("message_id")
+    meta = chat_state.get_message(message_id) if message_id else None
+    if meta is None:
+        return
+    kind = data.get("kind", "answer")
+    text = str(data.get("text") or "")
+    if kind == "error":
+        text = f"⚠️ {text}"
+    await _deliver_text(bot, meta["user_id"], text, data.get("image_base64"))
+    # голос: если пришло голосом — озвучиваем на ПК
+    if meta.get("origin") == "voice":
+        await speak_to_owner(meta["user_id"], text)
+
+
+async def handle_confirm_request(bot: Bot, agent_id: str, data: dict) -> None:
+    """Разрушительное действие от локального мозга — всегда подтверждение
+    в Telegram владельца (граница безопасности не зависит от канала)."""
+    from db import add_eva_command
+    from eva_agent_registry import get_owner_id_for_agent
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    owner_id = get_owner_id_for_agent(agent_id)
+    if owner_id is None:
+        return
+
+    steps = data.get("local_steps") or []
+    if not steps:
+        return
+    payload = {"steps": steps}
+    meta = None
+    message_id = data.get("message_id")
+    if message_id:
+        meta = chat_state.get_message(message_id)
+        if data.get("voice"):  # голос: результаты озвучивать
+            payload["voice"] = True
+
+    command_id = await add_eva_command(
+        owner_id,
+        meta["command_text"] if meta else "действие с ПК",
+        action_json=json.dumps(payload),
+        status="awaiting_confirmation",
+    )
+    numbered = "\n".join(f"{i}. {s.get('description','')}" for i, s in enumerate(steps, start=1))
+    body = f"⚠️ Локальный мозг предлагает:\n{numbered}"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"eva_confirm:{command_id}"),
+        InlineKeyboardButton(text="❌ Отменить", callback_data=f"eva_cancel:{command_id}"),
+    ]])
+    await bot.send_message(owner_id, f"{body}\nПодтверди выполнение:", reply_markup=keyboard)
+
+
+async def handle_cloud_action(ws, data: dict) -> None:
+    """Облачное действие локального мозга. Исполняется на сервере,
+    результат возвращается агенту как cloud_result (синтез ответа — агент)."""
+    request_id = data.get("request_id")
+    action = data.get("action")
+    params = data.get("params") or {}
+    if not request_id or not action:
+        return
+    try:
+        from cloud_actions import execute_cloud_action
+        result = await execute_cloud_action(action, params)
+    except ImportError:
+        result = {"status": "error", "result": "cloud_actions not ready"}
+    payload = {"type": "cloud_result", "request_id": request_id, **result}
+    try:
+        await ws.send_str(json.dumps(payload))
+    except Exception as e:
+        print(f"⚠️ Не удалось вернуть cloud_result: {e}", flush=True)
