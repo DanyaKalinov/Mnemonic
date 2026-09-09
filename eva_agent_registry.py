@@ -95,3 +95,8 @@ async def speak_to_owner(owner_id: int, text: str) -> bool:
         except Exception as e:
             print(f"⚠️ Не удалось отправить 'speak' агенту: {e}", flush=True)
     return sent
+
+
+async def notify_app(user_id: int, role: str, text: str) -> bool:
+    """Показывает строку в чате-приложении у пользователя (role: user|eva|system)."""
+    return await send_to_user_agent(user_id, {"type": "chat_echo", "role": role, "text": text})

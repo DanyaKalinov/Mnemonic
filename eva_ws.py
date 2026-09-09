@@ -138,6 +138,11 @@ async def _handle_result_message(data: dict, bot: Bot) -> None:
     except Exception as e:
         print(f"⚠️ Не удалось уведомить о результате команды {command_id}: {e}", flush=True)
 
+    # Если команда изначально пришла из приложения (агент запросил подтверждение),
+    # продублировать итог в чат приложения.
+    from eva_agent_registry import notify_app
+    await notify_app(command["requested_by"], "eva", f"{icon} {result or 'готово'}")
+
 
 async def _handle_voice_command_message(data: dict, bot: Bot, agent_id: str) -> None:
     """Голосовая команда с агента (после локального wake word + STT).

@@ -1,6 +1,7 @@
 import pytest
 from chat_state import new_message_id, register_message
 from eva_engine import handle_chat_result, handle_confirm_request
+from eva_agent_registry import register_agent, unregister_agent, notify_app
 
 
 class FakeBot:
@@ -43,3 +44,19 @@ async def test_confirm_request_creates_command_with_buttons(monkeypatch):
         assert any(s["chat_id"] == 111 and s["kw"].get("reply_markup") for s in bot.sent)
     finally:
         unregister_agent("p1")
+
+
+class FakeWS:
+    def __init__(self):
+        self.sent = []
+    async def send_str(self, s):
+        self.sent.append(s)
+
+
+@pytest.mark.asyncio
+async def test_notify_app_sends_chat_echo():
+    ws = FakeWS()
+    register_agent("p1", ws, owner_id=111)
+    ok = await notify_app(111, "eva", "готово")
+    assert ok and '"role": "eva"' in ws.sent[0]
+    unregister_agent("p1")
