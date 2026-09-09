@@ -783,6 +783,12 @@ async def handle_text(message: Message):
         await handle_reminder_command(message)
         return
 
+    # Онлайн-ретрансляция к локальному мозгу (если агент на связи)
+    from eva_engine import is_agent_online, relay_to_agent
+    if is_agent_online(user_id):
+        await relay_to_agent(message.bot, user_id, user_text, message.answer, "telegram")
+        return
+
     await add_memory(user_id, user_text)
 
     await message.answer("🧠 Думаю...")

@@ -15,17 +15,54 @@
 """
 import json
 import re
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Optional
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from ai_core import interpret_eva_command, ask_web
 from db import add_eva_command
-from eva_agent_registry import push_command_to_agents
+from eva_agent_registry import push_command_to_agents, get_user_agent, send_to_user_agent, speak_to_owner
 from eva_command_parser import parse_eva_command, split_into_subcommands
+from chat_state import new_message_id, register_message, get_message as chat_state_get_message
+from memory import search_memory
 
 ReplyFunc = Callable[[str], Awaitable[None]]
+
+# Каналы, в которых "говорим" с агентом.
+_ORIGIN_TELEGRAM = "telegram"
+_ORIGIN_VOICE = "voice"
+_ORIGIN_APP = "app"
+
+TOP_MEMORY_K = 5
+
+
+def is_agent_online(user_id: int) -> bool:
+    """Есть ли у этого пользователя подключённый desktop-агент."""
+    return get_user_agent(user_id) is not None
+
+
+async def relay_to_agent(bot: Bot, user_id: int, text: str, reply: ReplyFunc, source: str) -> None:
+    """Онлайн-путь: сырой текст + инъекция памяти уходит агенту как 'chat'.
+    Мозг (локальная модель) отвечает сам; это не разбор на сервере."""
+    origin = _ORIGIN_VOICE if source == "voice" else _ORIGIN_TELEGRAM
+    message_id = new_message_id()
+    register_message(message_id, user_id, origin, text)
+
+    memories = await search_memory(user_id, text, k=TOP_MEMORY_K)
+    payload = {
+        "type": "chat",
+        "message_id": message_id,
+        "text": text,
+        "origin": origin,
+        "memory": memories,
+    }
+    sent = await send_to_user_agent(user_id, payload)
+    if not sent:
+        await reply("📥 Агент сейчас не на связи — попробуй позже.")
+        return
+    if origin == _ORIGIN_TELEGRAM:
+        await reply("🧠 Отправила Еве, жду ответ...")
 
 # Местоимения-указатели: если шаг целиком состоит из "открой её/его/это"
 # после шага search_file — заменяем на open_folder с тем же запросом.
@@ -104,6 +141,11 @@ async def process_eva_command(
         уходят агенту с пометкой voice=True — агент дополнительно озвучит
         результат вслух через TTS, а не просто выполнит молча.
     """
+    # Онлайн-ретрансляция: локальный мозг думает, сервер только передаёт.
+    if is_agent_online(user_id):
+        await relay_to_agent(bot, user_id, command_text, reply, source)
+        return
+
     step_texts = split_into_subcommands(command_text)
     steps = []
     descriptions = []
@@ -138,7 +180,11 @@ async def process_eva_command(
             prev_query = params.get("query")
 
     if not steps:
-        return  # была только просьба узнать что-то в интернете — агенту отправлять нечего
+        # Не действие, а обычный вопрос — при офлайн агенте отвечает Gemini.
+        from ai_core import get_ai_response
+        answer = await get_ai_response(user_id, command_text)
+        await reply(answer)
+        return
 
     payload: dict = {"steps": steps} if len(steps) > 1 else dict(steps[0])
     if source == "voice":

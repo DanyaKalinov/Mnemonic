@@ -37,6 +37,27 @@ def get_owner_id_for_agent(agent_id: str) -> Optional[int]:
     return entry["owner_id"] if entry else None
 
 
+def get_user_agent(user_id: int) -> Optional[web.WebSocketResponse]:
+    """WS-сокет агента, подключённого к этому пользователю (или None)."""
+    for entry in _connected_agents.values():
+        if entry["owner_id"] == user_id:
+            return entry["ws"]
+    return None
+
+
+async def send_to_user_agent(user_id: int, payload: dict) -> bool:
+    """Отправляет произвольный JSON-объект агенту конкретного пользователя."""
+    ws = get_user_agent(user_id)
+    if ws is None:
+        return False
+    try:
+        await ws.send_str(json.dumps(payload))
+        return True
+    except Exception as e:
+        print(f"⚠️ Не удалось отправить '{payload.get('type')}' агенту {user_id}: {e}", flush=True)
+        return False
+
+
 async def push_command_to_agents(command_id: int, action_json: str) -> bool:
     """Пытается сразу отправить структурированное действие подключённому
     агенту. action_json — JSON-строка вида {"action": "...", "params": {...}}
