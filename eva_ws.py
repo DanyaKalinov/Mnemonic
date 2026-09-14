@@ -123,6 +123,17 @@ async def _handle_agent_message(raw: str, bot: Bot, agent_id: str, ws: web.WebSo
                     }
                 )
             )
+    elif msg_type == "agent_notify":
+        from eva_agent_registry import notify_app
+        text = data.get("text", "")
+        owner_id = get_owner_id_for_agent(agent_id)
+        if owner_id is None or not text:
+            return
+        try:
+            await bot.send_message(owner_id, f"🗔 Ева заметила: {text}")
+        except Exception as e:
+            print(f"⚠️ Не удалось отправить agent_notify в Telegram: {e}", flush=True)
+        await notify_app(owner_id, "eva", text)
     # неизвестные типы просто игнорируем — вперёд совместимость
 
 

@@ -60,3 +60,18 @@ async def test_notify_app_sends_chat_echo():
     ok = await notify_app(111, "eva", "готово")
     assert ok and '"role": "eva"' in ws.sent[0]
     unregister_agent("p1")
+
+
+@pytest.mark.asyncio
+async def test_agent_notify_sends_telegram_to_owner():
+    from eva_ws import _handle_agent_message
+    bot = FakeBot()
+    ws = FakeWS()
+    register_agent("p1", ws, owner_id=111)
+    try:
+        await _handle_agent_message(
+            '{"type": "agent_notify", "text": "курс доллара обновился"}', bot, "p1", ws
+        )
+        assert any(s["chat_id"] == 111 and "курс доллара" in s["text"] for s in bot.sent)
+    finally:
+        unregister_agent("p1")
