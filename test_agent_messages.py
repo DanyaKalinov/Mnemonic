@@ -1,7 +1,7 @@
 import pytest
 from chat_state import new_message_id, register_message
 from eva_engine import handle_chat_result, handle_confirm_request
-from eva_agent_registry import register_agent, unregister_agent, notify_app
+from eva_agent_registry import register_agent, unregister_agent, notify_app, notify_agent_reminder
 
 
 class FakeBot:
@@ -60,6 +60,26 @@ async def test_notify_app_sends_chat_echo():
     ok = await notify_app(111, "eva", "готово")
     assert ok and '"role": "eva"' in ws.sent[0]
     unregister_agent("p1")
+
+
+@pytest.mark.asyncio
+async def test_notify_agent_reminder_offline_is_false():
+    ok = await notify_agent_reminder(99999, "вынести мусор")
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_notify_agent_reminder_online_sends_reminder_payload():
+    ws = FakeWS()
+    register_agent("p1", ws, owner_id=111)
+    try:
+        ok = await notify_agent_reminder(111, "вынести мусор")
+        import json
+        sent = json.loads(ws.sent[0])
+        assert ok is True
+        assert sent == {"type": "reminder", "text": "вынести мусор"}
+    finally:
+        unregister_agent("p1")
 
 
 @pytest.mark.asyncio

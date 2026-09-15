@@ -20,6 +20,7 @@ from ai_core import summarize_for_digest
 from access_control import ApprovalMiddleware
 from error_handler import register_error_handler
 from eva_ws import eva_ws_handler
+from eva_agent_registry import notify_agent_reminder
 from bot_commands import set_default_commands, sync_commands_for_user
 
 logging.basicConfig(level=logging.INFO)
@@ -63,6 +64,10 @@ async def check_reminders(bot: Bot):
             ]])
             try:
                 await bot.send_message(user_id, f"⏰ Напоминание: {text}", reply_markup=keyboard)
+                # Дублируем напоминание подключённому desktop-агенту — он покажет
+                # тост и проиграет звук на ПК владельца. Если агент офлайн,
+                # notify_agent_reminder вернёт False — просто пропускаем.
+                await notify_agent_reminder(user_id, text)
                 if recurrence:
                     # Повторяющееся — переносим на следующий срок, не помечаем отправленным насовсем
                     await reschedule_reminder(reminder['id'], recurrence)

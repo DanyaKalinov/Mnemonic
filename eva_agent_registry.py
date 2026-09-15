@@ -58,6 +58,14 @@ async def send_to_user_agent(user_id: int, payload: dict) -> bool:
         return False
 
 
+async def notify_agent_reminder(user_id: int, text: str) -> bool:
+    """Отправить напоминание подключённому desktop-агенту (тост + звук на ПК).
+
+    Возвращает True, если агент был онлайн и получил сообщение.
+    """
+    return await send_to_user_agent(user_id, {"type": "reminder", "text": text})
+
+
 async def push_command_to_agents(command_id: int, action_json: str) -> bool:
     """Пытается сразу отправить структурированное действие подключённому
     агенту. action_json — JSON-строка вида {"action": "...", "params": {...}}
