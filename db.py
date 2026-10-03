@@ -17,7 +17,7 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
 
 
 async def init_db() -> None:
-    """Создаёт пул соединений с Postgres. Вызывается один раз при старте бота."""
+    """Создаёт пул соединений с Postgres и инициализирует необходимые таблицы."""
     global _pool
     if not DATABASE_URL:
         raise ValueError("❌ DATABASE_URL не задан в .env")
@@ -32,6 +32,9 @@ async def init_db() -> None:
         # asyncpg использует их по умолчанию, поэтому явно отключаем кэш.
         statement_cache_size=0,
     )
+    
+    # Автоматически создаем таблицу задач при запуске
+    await create_tasks_table_if_not_exists()
 
 
 async def close_db() -> None:
@@ -393,3 +396,108 @@ async def update_eva_command_status(
             """,
             command_id, status, result_text,
         )
+
+
+# ----- Задачи (Tasks) -----
+async def create_tasks_table_if_not_exists() -> None:
+    """Создаёт таблицу задач tasks, если её ещё нет."""
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                interval_minutes INT DEFAULT 0,
+                created_at TIMESTAMPTZ DEFAULT now()
+            );
+            """
+        )
+
+
+async def add_single_task(user_id: int, title: str) -> int:
+    """Добавляет одну задачу для пользователя."""
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO tasks (user_id, title)
+            VALUES ($1, $2)
+            RETURNING id
+            """,
+            user_id, title,
+        )
+    return row["id"]
+
+
+async def add_tasks_batch(user_id: int, tasks_titles: list[str], interval_minutes: int = 0) -> list[int]:
+    """Массово добавляет список задач."""
+    async with get_pool().acquire() as conn:
+        query = """
+            INSERT INTO tasks (user_id, title, interval_minutes)
+            VALUES ($1, $2, $3)
+            RETURNING id
+        """
+        inserted_ids = []
+        for title in tasks_titles:
+            row = await conn.fetchrow(query, user_id, title, interval_minutes)
+            inserted_ids.append(row["id"])
+        return inserted_ids
+
+
+async def get_user_tasks(user_id: int) -> list[dict]:
+    """Возвращает все задачи пользователя."""
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, title, status, interval_minutes, created_at
+            FROM tasks
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            """,
+            user_id,
+        )
+    return [dict(row) for row in rows]
+
+
+async def toggle_task_status(task_id: int) -> Optional[str]:
+    """Переключает статус задачи с pending на completed и наоборот."""
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow("SELECT status FROM tasks WHERE id = $1", task_id)
+        if not row:
+            return None
+        new_status = "completed" if row["status"] == "pending" else "pending"
+        await conn.execute("UPDATE tasks SET status = $2 WHERE id = $1", task_id, new_status)
+    return new_status
+
+
+async def edit_task_title(task_id: int, new_title: str) -> bool:
+    """Обновляет название задачи."""
+    async with get_pool().acquire() as conn:
+        result = await conn.execute(
+            "UPDATE tasks SET title = $2 WHERE id = $1", task_id, new_title
+        )
+    return int(result.split()[-1]) > 0
+
+
+async def clear_completed_tasks(user_id: int) -> int:
+    """Удаляет все завершённые задачи пользователя."""
+    async with get_pool().acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM tasks WHERE user_id = $1 AND status = 'completed'", user_id
+        )
+    return int(result.split()[-1])
+
+
+async def get_pending_task_reminders() -> list[dict]:
+    """Возвращает все невыполненные задачи для отправки напоминаний."""
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, title, interval_minutes, created_at
+            FROM tasks
+            WHERE status = 'pending'
+            ORDER BY created_at
+            """
+        )
+    return [dict(row) for row in rows]
