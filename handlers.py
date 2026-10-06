@@ -4,12 +4,15 @@ import tempfile
 from datetime import datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
-from aiogram import Router, types
+from aiogram import Router, F, types
 from aiogram.filters import Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
 )
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 import PyPDF2
 from dotenv import load_dotenv
 from timezonefinder import TimezoneFinder
@@ -22,6 +25,7 @@ from db import (
     list_users, get_stats,
     set_user_role, is_owner, get_eva_command, update_eva_command_status,
     can_use_eva, set_eva_access, list_owner_ids, list_eva_access_users,
+    get_user_tasks, toggle_task_status, add_single_task, add_tasks_batch, clear_completed_tasks
 )
 from reminder_parser import parse_reminder_text
 from memory import add_memory
@@ -31,17 +35,15 @@ from eva_engine import process_eva_command
 from bot_commands import sync_commands_for_user
 
 load_dotenv()
-# TimezoneFinder держит в памяти геоданные — создаём один раз на процесс,
-# а не при каждом сообщении с локацией.
+
 _tz_finder = TimezoneFinder()
 router = Router()
 
-# ----- Состояние ожидания ввода для Dashboard -----
-# Когда пользователь нажал на кнопку панели, которой нужен текст-параметр
-# (например «Открыть файл»), мы запоминаем тут, что от него ждём следующее
-# сообщение. handle_text сверяет этот словарь ДО обычной обработки и
-# превращает введённый текст в команду Еве. Хранится в памяти процесса —
-# потеряется при рестарте бота, для этого сценария это нормально.
+# ----- FSM Состояние для создания задач -----
+class TaskCreationStates(StatesGroup):
+    waiting_for_task_text = State()
+
+# ----- Состояние ожидания ввода для Dashboard Евы -----
 _pending_dashboard_input: dict[int, str] = {}
 
 # Кнопки с мгновенным действием: callback-суффикс -> текст команды Еве
@@ -56,7 +58,6 @@ _DASHBOARD_DIRECT = {
 }
 
 # Кнопки, которым нужен ввод: callback-суффикс -> (текст-подсказка, шаблон команды).
-# {input} в шаблоне заменится на то, что пользователь напишет следующим сообщением.
 _DASHBOARD_INPUT = {
     "open_file": ("📄 Что открыть? Напиши путь или имя файла.", "открой файл {input}"),
     "search_file": ("🔍 Что найти на компьютере? Напиши название файла.", "найди файл {input}"),
@@ -65,7 +66,101 @@ _DASHBOARD_INPUT = {
     "type_text": ("⌨️ Что напечатать в активном окне?", "напиши {input}"),
 }
 
-# ----- Текст с текущим уровнем доступа (боту / полным функциям Евы) -----
+
+# ----- Хелперы для Дашборда Задач -----
+def build_progress_bar(completed: int, total: int, length: int = 10) -> str:
+    """Формирует текстовый прогресс-бар."""
+    if total == 0:
+        return "[░░░░░░░░░░] 0%"
+    percent = completed / total
+    filled_length = int(round(length * percent))
+    bar = "█" * filled_length + "░" * (length - filled_length)
+    return f"[{bar}] {int(percent * 100)}%"
+
+
+def render_dashboard_text(tasks: list[dict], filter_type: str = "all") -> str:
+    """Формирует текст сообщения дашборда задач."""
+    total = len(tasks)
+    completed_count = sum(1 for t in tasks if t.get('status') == 'completed')
+    in_progress = total - completed_count
+
+    progress_bar = build_progress_bar(completed_count, total)
+
+    summary = (
+        "📊 <b>Дашборд задач Евы</b>\n\n"
+        f"🎯 <b>Прогресс:</b> {progress_bar}\n"
+        f"📥 Всего: {total} | ⏳ В работе: {in_progress} | ✅ Готово: {completed_count}\n"
+        "─────────────────"
+    )
+
+    filtered = tasks
+    if filter_type == "pending":
+        filtered = [t for t in tasks if t.get('status') == 'pending']
+    elif filter_type == "completed":
+        filtered = [t for t in tasks if t.get('status') == 'completed']
+
+    if not filtered:
+        return summary + "\n\n🎉 <i>Задач в этой категории нет!</i>"
+
+    task_lines = []
+    for idx, task in enumerate(filtered):
+        is_done = task.get('status') == 'completed'
+        status_icon = "✅" if is_done else "⏳"
+        title = task['title']
+
+        if is_done:
+            title = f"<s>{title}</s>"
+
+        task_lines.append(f"{idx + 1}. {status_icon} #{task['id']} — {title}")
+
+    return summary + "\n\n" + "\n".join(task_lines)
+
+
+def build_dashboard_keyboard(tasks: list[dict], filter_type: str = "all") -> InlineKeyboardMarkup:
+    """Собирает клавиатуру для дашборда задач."""
+    builder = InlineKeyboardBuilder()
+
+    builder.row(
+        InlineKeyboardButton(
+            text="• Все •" if filter_type == "all" else "Все",
+            callback_data="taskdash_filter:all"
+        ),
+        InlineKeyboardButton(
+            text="• ⏳ В работе •" if filter_type == "pending" else "⏳ В работе",
+            callback_data="taskdash_filter:pending"
+        ),
+        InlineKeyboardButton(
+            text="• ✅ Готово •" if filter_type == "completed" else "✅ Готово",
+            callback_data="taskdash_filter:completed"
+        )
+    )
+
+    filtered = tasks
+    if filter_type == "pending":
+        filtered = [t for t in tasks if t.get('status') == 'pending']
+    elif filter_type == "completed":
+        filtered = [t for t in tasks if t.get('status') == 'completed']
+
+    for task in filtered:
+        is_done = task.get('status') == 'completed'
+        btn_icon = "↩️ Вернуть" if is_done else "✅ Сделать"
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{btn_icon} #{task['id']}",
+                callback_data=f"taskdash_toggle:{task['id']}:{filter_type}"
+            )
+        )
+
+    builder.row(
+        InlineKeyboardButton(text="➕ Новая задача", callback_data="taskdash_add"),
+        InlineKeyboardButton(text="🧹 Очистить готовые", callback_data="taskdash_clear"),
+        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"taskdash_refresh:{filter_type}")
+    )
+
+    return builder.as_markup()
+
+
+# ----- Текст с текущим уровнем доступа -----
 def _eva_access_line(user: dict) -> str:
     if user["role"] == "owner":
         return "🤖 Доступ к полным функциям (Ева): ✅ есть (владелец)"
@@ -75,10 +170,7 @@ def _eva_access_line(user: dict) -> str:
         return "🤖 Доступ к полным функциям (Ева): ⏳ заявка на рассмотрении"
     return "🤖 Доступ к полным функциям (Ева): ❌ нет — запросить: /eva_request"
 
-# (Описание действий Евы для подтверждения теперь в eva_engine.describe_eva_action)
 
-
-# ----- Уведомление админа о новой/повторной заявке -----
 async def notify_admin_new_request(bot, user_id: int, tg_user: types.User) -> None:
     username_display = f"@{tg_user.username}" if tg_user.username else tg_user.full_name
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
@@ -93,6 +185,7 @@ async def notify_admin_new_request(bot, user_id: int, tg_user: types.User) -> No
         )
     except Exception as e:
         print(f"Не удалось уведомить администратора о заявке {user_id}: {e}")
+
 
 # ----- Команда /start -----
 @router.message(Command("start"))
@@ -134,6 +227,7 @@ async def cmd_start(message: Message):
         "и могу найти это по смыслу даже через месяцы.\n\n"
         "📌 **Просто напиши мне что угодно** — я сохраню это в память.\n"
         "🔍 **Спроси меня о чём‑то** — я найду ответ среди твоих записей.\n"
+        "📊 **Дашборд задач** — отправь /dashboard для управления задачами.\n"
         "📄 **Отправь PDF** — я прочитаю и запомню его содержание.\n"
         "🎤 **Отправь голосовое** — я распознаю речь и сохраню текст.\n"
         "🖼 **Отправь фото** — я опишу его и распознаю текст, если есть.\n\n"
@@ -146,7 +240,106 @@ async def cmd_start(message: Message):
     )
     await message.answer(welcome_text)
 
-# ----- Обработка нажатий на кнопки "Одобрить"/"Отклонить" -----
+
+# ----- Хэндлеры Дашборда Задач (To-Do) -----
+@router.message(Command("dashboard"))
+@router.message(F.text == "📊 Дашборд задач")
+async def show_dashboard_cmd(message: Message):
+    """Выводит дашборд задач."""
+    tasks = await get_user_tasks(user_id=message.from_user.id)
+    text = render_dashboard_text(tasks, "all")
+    kb = build_dashboard_keyboard(tasks, "all")
+    await message.answer(text=text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("taskdash_filter:"))
+async def handle_dashboard_filter(callback: CallbackQuery):
+    filter_type = callback.data.split(":")[1]
+    tasks = await get_user_tasks(user_id=callback.from_user.id)
+
+    text = render_dashboard_text(tasks, filter_type)
+    kb = build_dashboard_keyboard(tasks, filter_type)
+
+    await callback.message.edit_text(text=text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("taskdash_toggle:"))
+async def handle_task_toggle(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    task_id = int(parts[1])
+    filter_type = parts[2]
+
+    await toggle_task_status(task_id=task_id)
+
+    tasks = await get_user_tasks(user_id=callback.from_user.id)
+    text = render_dashboard_text(tasks, filter_type)
+    kb = build_dashboard_keyboard(tasks, filter_type)
+
+    await callback.message.edit_text(text=text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer("Статус обновлён!")
+
+
+@router.callback_query(F.data == "taskdash_clear")
+async def handle_clear_completed(callback: CallbackQuery):
+    deleted_count = await clear_completed_tasks(user_id=callback.from_user.id)
+
+    tasks = await get_user_tasks(user_id=callback.from_user.id)
+    text = render_dashboard_text(tasks, "all")
+    kb = build_dashboard_keyboard(tasks, "all")
+
+    await callback.message.edit_text(text=text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer(f"Удалено задач: {deleted_count}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("taskdash_refresh:"))
+async def handle_refresh(callback: CallbackQuery):
+    filter_type = callback.data.split(":")[1]
+    tasks = await get_user_tasks(user_id=callback.from_user.id)
+
+    text = render_dashboard_text(tasks, filter_type)
+    kb = build_dashboard_keyboard(tasks, filter_type)
+
+    await callback.message.edit_text(text=text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer("Данные обновлены")
+
+
+@router.callback_query(F.data == "taskdash_add")
+async def start_task_creation(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(TaskCreationStates.waiting_for_task_text)
+    await callback.message.answer(
+        "📝 <b>Введите новую задачу</b> (или несколько задач, каждую с новой строки):",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.message(TaskCreationStates.waiting_for_task_text)
+async def handle_task_input(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    user_id = message.from_user.id
+
+    if not text:
+        await message.answer("Текст задачи не может быть пустым.")
+        return
+
+    if "\n" in text:
+        task_titles = [t.strip() for t in text.split("\n") if t.strip()]
+        if task_titles:
+            await add_tasks_batch(user_id=user_id, tasks_titles=task_titles, interval_minutes=0)
+    else:
+        await add_single_task(user_id=user_id, title=text)
+
+    await state.clear()
+
+    tasks = await get_user_tasks(user_id=user_id)
+    text_dashboard = render_dashboard_text(tasks, "all")
+    kb_dashboard = build_dashboard_keyboard(tasks, "all")
+
+    await message.answer(text=text_dashboard, reply_markup=kb_dashboard, parse_mode="HTML")
+
+
+# ----- Обработка одобрений и остальной функционал -----
 @router.callback_query(lambda c: c.data and (c.data.startswith("approve:") or c.data.startswith("reject:")))
 async def handle_approval_decision(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -181,11 +374,12 @@ async def handle_approval_decision(callback: CallbackQuery):
 
     await callback.answer()
 
-# ----- Кнопки под напоминанием: "Сделано" / "Отложить на час" -----
+
 @router.callback_query(lambda c: c.data and c.data.startswith("remdone:"))
 async def handle_reminder_done(callback: CallbackQuery):
     await callback.message.edit_text(callback.message.text + "\n\n✅ Отмечено как сделано")
     await callback.answer()
+
 
 @router.callback_query(lambda c: c.data and c.data.startswith("remsnooze:"))
 async def handle_reminder_snooze(callback: CallbackQuery):
@@ -194,7 +388,7 @@ async def handle_reminder_snooze(callback: CallbackQuery):
     await callback.message.edit_text(callback.message.text + "\n\n⏰ Отложено на час")
     await callback.answer()
 
-# ----- Команда /timezone (определение часового пояса по геолокации) -----
+
 @router.message(Command("timezone"))
 async def cmd_timezone(message: Message):
     keyboard = ReplyKeyboardMarkup(
@@ -208,7 +402,7 @@ async def cmd_timezone(message: Message):
         reply_markup=keyboard,
     )
 
-# ----- Обработка геолокации -----
+
 @router.message(lambda msg: msg.location is not None)
 async def handle_location(message: Message):
     tz_name = _tz_finder.timezone_at(
@@ -231,7 +425,7 @@ async def handle_location(message: Message):
         reply_markup=ReplyKeyboardRemove(),
     )
 
-# ----- Команда /help -----
+
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     help_text = (
@@ -239,9 +433,10 @@ async def cmd_help(message: Message):
         "📝 /start — Показать приветствие\n"
         "❓ /help — Показать справку\n"
         "📊 /status — Проверить уровень доступа (бот / Ева)\n"
-        "📋 /reminders — Список активных напоминаний (можно отменять)\n"
+        "📋 /dashboard — Дашборд задач (To-Do list)\n"
+        "📋 /reminders — Список активных напоминаний\n"
         "🌍 /timezone — Настроить часовой пояс по геолокации\n"
-        "🗂 /memory — Последние записи в памяти (можно удалять)\n"
+        "🗂 /memory — Последние записи в памяти\n"
         "📰 /digest — Дайджест памяти за сутки\n\n"
         "🧠 **Просто напиши текст** — я запомню его\n"
         "🔎 **Задай вопрос** — я найду ответ среди твоих записей\n"
@@ -270,7 +465,7 @@ async def cmd_help(message: Message):
             "📸 /screenshot — Сделать скриншот экрана\n"
             "🔍 /find <что> — Найти файл или папку на компьютере\n"
             "📂 /open <путь> — Открыть файл или папку\n"
-            "🎛 /dashboard — Панель управления Евой (кнопки)\n"
+            "🎛 /eva_dashboard — Панель управления Евой (кнопки)\n"
             "📡 /agent_status — Подключён ли desktop-агент\n"
             "👥 /eva_users — Кто имеет доступ к Еве\n"
             "🚫 /eva_revoke <id> — Отозвать доступ к Еве"
@@ -282,7 +477,7 @@ async def cmd_help(message: Message):
             "📸 /screenshot — Сделать скриншот экрана\n"
             "🔍 /find <что> — Найти файл или папку на компьютере\n"
             "📂 /open <путь> — Открыть файл или папку\n"
-            "🎛 /dashboard — Панель управления Евой (кнопки)\n"
+            "🎛 /eva_dashboard — Панель управления Евой (кнопки)\n"
             "📡 /agent_status — Подключён ли desktop-агент"
         )
     else:
@@ -292,7 +487,7 @@ async def cmd_help(message: Message):
         )
     await message.answer(help_text)
 
-# ----- Команда /status — уровень доступа пользователя -----
+
 @router.message(Command("status"))
 async def cmd_status(message: Message):
     user = await get_user(message.from_user.id)
@@ -310,7 +505,7 @@ async def cmd_status(message: Message):
 
     await message.answer(f"{bot_access_line}\n{access_line}")
 
-# ----- Команда /reminders (список активных напоминаний + удаление) -----
+
 @router.message(Command("reminders"))
 async def cmd_reminders(message: Message):
     user_id = message.from_user.id
@@ -332,7 +527,7 @@ async def cmd_reminders(message: Message):
         ]])
         await message.answer(f"• {r['text']} — {when}{suffix}", reply_markup=keyboard)
 
-# ----- Обработка нажатия "Отменить" в /reminders -----
+
 @router.callback_query(lambda c: c.data and c.data.startswith("delrem:"))
 async def handle_delete_reminder(callback: CallbackQuery):
     reminder_id = int(callback.data.split(":")[1])
@@ -344,7 +539,7 @@ async def handle_delete_reminder(callback: CallbackQuery):
         await callback.message.edit_text("⚠️ Напоминание уже отменено или не найдено.")
     await callback.answer()
 
-# ----- Команда /memory (список последних записей + удаление) -----
+
 @router.message(Command("memory"))
 async def cmd_memory(message: Message):
     user_id = message.from_user.id
@@ -361,7 +556,7 @@ async def cmd_memory(message: Message):
         ]])
         await message.answer(f"{tag_label}{preview}", reply_markup=keyboard)
 
-# ----- Обработка нажатия "Удалить" в /memory -----
+
 @router.callback_query(lambda c: c.data and c.data.startswith("delmem:"))
 async def handle_delete_memory(callback: CallbackQuery):
     memory_id = int(callback.data.split(":")[1])
@@ -373,9 +568,7 @@ async def handle_delete_memory(callback: CallbackQuery):
         await callback.message.edit_text("⚠️ Запись уже удалена или не найдена.")
     await callback.answer()
 
-# ----- Команда /digest — дайджест памяти по запросу -----
-# В отличие от ежедневного автодайджеста (main.py send_daily_digest), тут
-# пользователь сам просит сжатое саммари своих записей за последние сутки.
+
 @router.message(Command("digest"))
 async def cmd_digest(message: Message):
     user_id = message.from_user.id
@@ -408,7 +601,6 @@ async def cmd_digest(message: Message):
     await message.answer(f"📰 Дайджест за сутки:\n\n{summary}")
 
 
-# ----- Админ: /users -----
 @router.message(Command("users"))
 async def cmd_users(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -424,7 +616,7 @@ async def cmd_users(message: Message):
     ]
     await message.answer("👥 Пользователи (последние 50):\n" + "\n".join(lines))
 
-# ----- Админ: /revoke <id> -----
+
 @router.message(Command("revoke"))
 async def cmd_revoke(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -445,7 +637,7 @@ async def cmd_revoke(message: Message):
     except Exception as e:
         print(f"Не удалось уведомить пользователя {target_user_id} об отзыве доступа: {e}")
 
-# ----- Админ: /stats -----
+
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -461,13 +653,13 @@ async def cmd_stats(message: Message):
     )
     await message.answer(text)
 
-# ----- Ева: запрос доступа обычным пользователем -----
+
 @router.message(Command("eva_request"))
 async def cmd_eva_request(message: Message):
     user_id = message.from_user.id
     user = await get_user(user_id)
     if user is None:
-        return  # мидлварь и так не пропустит неодобренного, но на всякий случай
+        return
     if user["role"] == "owner" or user["eva_access"] == "granted":
         await message.answer("✅ У тебя уже есть доступ к Еве — просто используй /eva <команда>.")
         return
@@ -495,7 +687,7 @@ async def cmd_eva_request(message: Message):
 
     await message.answer("📨 Заявка отправлена владельцу, жди решения.")
 
-# ----- Ева: владелец разрешает/отклоняет запрос -----
+
 @router.callback_query(lambda c: c.data and (c.data.startswith("eva_grant:") or c.data.startswith("eva_deny:")))
 async def handle_eva_access_decision(callback: CallbackQuery):
     if not await is_owner(callback.from_user.id):
@@ -523,7 +715,7 @@ async def handle_eva_access_decision(callback: CallbackQuery):
             pass
     await callback.answer()
 
-# ----- Ева: владелец отзывает ранее выданный доступ -----
+
 @router.message(Command("eva_revoke"))
 async def cmd_eva_revoke(message: Message):
     if not await is_owner(message.from_user.id):
@@ -543,7 +735,7 @@ async def cmd_eva_revoke(message: Message):
     except Exception:
         pass
 
-# ----- Ева: владелец смотрит, у кого есть доступ -----
+
 @router.message(Command("eva_users"))
 async def cmd_eva_users(message: Message):
     if not await is_owner(message.from_user.id):
@@ -560,7 +752,7 @@ async def cmd_eva_users(message: Message):
         lines.append(f"{icons.get(label, '•')} {u['user_id']} — {label}")
     await message.answer("\n".join(lines))
 
-# ----- Ева: /agent_status — подключён ли desktop-агент -----
+
 @router.message(Command("agent_status"))
 async def cmd_agent_status(message: Message):
     if not await can_use_eva(message.from_user.id):
@@ -574,13 +766,9 @@ async def cmd_agent_status(message: Message):
             "и выполнится, как только агент подключится."
         )
 
-# ----- Ева: /eva <команда> — поставить задачу desktop-агенту -----
-# (Разбор шагов команды теперь в eva_engine._resolve_step)
-
 
 @router.message(Command("screenshot"))
 async def cmd_screenshot(message: Message):
-    """Быстрая команда: /screenshot — сделать скриншот экрана."""
     if not await can_use_eva(message.from_user.id):
         await message.answer("⛔ У тебя нет доступа к Еве. Запросить: /eva_request")
         return
@@ -589,7 +777,6 @@ async def cmd_screenshot(message: Message):
 
 @router.message(Command("find"))
 async def cmd_find(message: Message):
-    """Быстрая команда: /find отчёт — найти файл или папку на компьютере."""
     if not await can_use_eva(message.from_user.id):
         await message.answer("⛔ У тебя нет доступа к Еве. Запросить: /eva_request")
         return
@@ -602,7 +789,6 @@ async def cmd_find(message: Message):
 
 @router.message(Command("open"))
 async def cmd_open(message: Message):
-    """Быстрая команда: /open report.pdf — открыть файл или папку."""
     if not await can_use_eva(message.from_user.id):
         await message.answer("⛔ У тебя нет доступа к Еве. Запросить: /eva_request")
         return
@@ -610,9 +796,6 @@ async def cmd_open(message: Message):
     if not path:
         await message.answer("Укажи путь: /open файл report.pdf или /open папку загрузки")
         return
-    # Если пользователь уже указал тип («файл …»/«папку …») — передаём как есть,
-    # иначе добавляем «файл» — open_file сам разберётся и с путём, и с псевдонимом
-    # папки (например «загрузки»), и с именем в кавычках.
     if path.lower().startswith(("файл", "папк")):
         await process_eva_command(message.bot, message.from_user.id, f"открой {path}", message.answer)
     else:
@@ -632,35 +815,14 @@ async def cmd_eva(message: Message):
             "Например:\n"
             "• /eva открой блокнот\n"
             "• /eva открой сайт youtube.com\n"
-            "• /eva создай файл notes.txt с текстом купить молоко\n"
-            "• /eva прочитай файл notes.txt\n"
-            "• /eva удали файл notes.txt\n"
-            "• /eva открой папку загрузки\n"
-            "• /eva найди и открой папку Проекты\n"
             "• /eva сделай скриншот\n"
-            "• /eva покажи файлы в загрузках\n"
-            "• /eva найди файл отчёт\n"
-            "• /eva сделай громче\n"
-            "• /eva заблокируй компьютер\n"
-            "• /eva напиши купить молоко\n"
-            "• /eva нажми ctrl+s\n"
-            "• /eva перемести курсор на 500 300\n"
-            "• /eva кликни мышью в 100 200\n"
-            "• /eva прокрути вниз\n"
-            "• /eva установи браузер по умолчанию opera\n"
-            "• /eva найди в яндексе погода через оперу\n"
-            "• /eva узнай курс доллара сегодня\n"
-            "• /eva нажми кнопку сохранить в окне блокнот\n\n"
-            "Можно и свободной формулировкой — если не узнаю фразу по "
-            "шаблону, попробую понять через ИИ.\n\n"
-            "Можно и несколько действий подряд, через «и»/«потом»/«затем»:\n"
-            "• /eva открой блокнот и напиши купить молоко"
+            "• /eva покажи файлы в загрузках"
         )
         return
 
     await process_eva_command(message.bot, message.from_user.id, command_text, message.answer)
 
-# ----- Ева: подтверждение/отмена файловой операции -----
+
 @router.callback_query(lambda c: c.data and (c.data.startswith("eva_confirm:") or c.data.startswith("eva_cancel:")))
 async def handle_eva_command_confirmation(callback: CallbackQuery):
     action, command_id_str = callback.data.split(":")
@@ -671,7 +833,6 @@ async def handle_eva_command_confirmation(callback: CallbackQuery):
         await callback.answer("Команда не найдена.", show_alert=True)
         return
 
-    # Подтвердить может либо тот, кто её запросил, либо владелец
     if callback.from_user.id != command["requested_by"] and not await is_owner(callback.from_user.id):
         await callback.answer("Подтвердить может только автор команды или владелец.", show_alert=True)
         return
@@ -690,49 +851,49 @@ async def handle_eva_command_confirmation(callback: CallbackQuery):
         await callback.message.edit_text(callback.message.text + "\n\n❌ Отменено.")
     await callback.answer()
 
-# ----- Dashboard: панель быстрых действий Евы -----
-def _dashboard_keyboard() -> InlineKeyboardMarkup:
+
+# ----- Dashboard: панель быстрых действий Евы на ПК -----
+def _eva_dashboard_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📸 Скриншот", callback_data="dash:screenshot"),
-            InlineKeyboardButton(text="🔊 Громче", callback_data="dash:vol_up"),
-            InlineKeyboardButton(text="🔉 Тише", callback_data="dash:vol_down"),
+            InlineKeyboardButton(text="📸 Скриншот", callback_data="evadash:screenshot"),
+            InlineKeyboardButton(text="🔊 Громче", callback_data="evadash:vol_up"),
+            InlineKeyboardButton(text="🔉 Тише", callback_data="evadash:vol_down"),
         ],
         [
-            InlineKeyboardButton(text="🔇 Звук", callback_data="dash:vol_mute"),
-            InlineKeyboardButton(text="📁 Файлы", callback_data="dash:list_files"),
-            InlineKeyboardButton(text="🔍 Найти файл", callback_data="dash:input:search_file"),
+            InlineKeyboardButton(text="🔇 Звук", callback_data="evadash:vol_mute"),
+            InlineKeyboardButton(text="📁 Файлы", callback_data="evadash:list_files"),
+            InlineKeyboardButton(text="🔍 Найти файл", callback_data="evadash:input:search_file"),
         ],
         [
-            InlineKeyboardButton(text="📄 Открыть файл", callback_data="dash:input:open_file"),
-            InlineKeyboardButton(text="🌐 Сайт", callback_data="dash:input:open_website"),
-            InlineKeyboardButton(text="🔎 Поиск", callback_data="dash:input:web_search"),
+            InlineKeyboardButton(text="📄 Открыть файл", callback_data="evadash:input:open_file"),
+            InlineKeyboardButton(text="🌐 Сайт", callback_data="evadash:input:open_website"),
+            InlineKeyboardButton(text="🔎 Поиск", callback_data="evadash:input:web_search"),
         ],
         [
-            InlineKeyboardButton(text="⌨️ Напечатать", callback_data="dash:input:type_text"),
-            InlineKeyboardButton(text="🔒 Блокировка", callback_data="dash:power_lock"),
-            InlineKeyboardButton(text="🔌 Выключить", callback_data="dash:power_shutdown"),
+            InlineKeyboardButton(text="⌨️ Напечатать", callback_data="evadash:input:type_text"),
+            InlineKeyboardButton(text="🔒 Блокировка", callback_data="evadash:power_lock"),
+            InlineKeyboardButton(text="🔌 Выключить", callback_data="evadash:power_shutdown"),
         ],
     ])
 
 
-@router.message(Command("dashboard"))
-async def cmd_dashboard(message: Message):
+@router.message(Command("eva_dashboard"))
+async def cmd_eva_dashboard(message: Message):
     if not await can_use_eva(message.from_user.id):
         await message.answer("⛔ У тебя нет доступа к Еве. Запросить: /eva_request")
         return
-    await message.answer("📋 Панель управления Евой:", reply_markup=_dashboard_keyboard())
+    await message.answer("📋 Панель управления Евой (Desktop):", reply_markup=_eva_dashboard_keyboard())
 
 
-@router.callback_query(lambda c: c.data and c.data.startswith("dash:"))
-async def handle_dashboard(callback: CallbackQuery):
+@router.callback_query(lambda c: c.data and c.data.startswith("evadash:"))
+async def handle_eva_dashboard(callback: CallbackQuery):
     if not await can_use_eva(callback.from_user.id):
         await callback.answer("⛔ У тебя нет доступа к Еве.", show_alert=True)
         return
 
-    action = callback.data[len("dash:"):]  # убираем префикс "dash:"
+    action = callback.data[len("evadash:"):]
 
-    # Кнопка с вводом параметра — просим пользователя написать значение
     if action.startswith("input:"):
         input_type = action[len("input:"):]
         prompt, _ = _DASHBOARD_INPUT[input_type]
@@ -741,7 +902,6 @@ async def handle_dashboard(callback: CallbackQuery):
         await callback.answer()
         return
 
-    # Мгновенное действие — уходит Еве напрямую
     command_text = _DASHBOARD_DIRECT.get(action)
     if not command_text:
         await callback.answer("Неизвестная кнопка.", show_alert=True)
@@ -753,18 +913,21 @@ async def handle_dashboard(callback: CallbackQuery):
     )
 
 
-# ----- Обработка текста (запоминание + AI-ответ) -----
+# ----- Обработка входящего текста -----
 @router.message(lambda msg: msg.text is not None)
-async def handle_text(message: Message):
+async def handle_text(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
-    # Если мы ждём от пользователя параметр для кнопки панели — берём это
-    # сообщение как значение, не сохраняем его в память и не отвечаем ИИ.
+    # Проверяем, находится ли пользователь в состоянии добавления задачи FSM
+    current_state = await state.get_state()
+    if current_state == TaskCreationStates.waiting_for_task_text.state:
+        await handle_task_input(message, state)
+        return
+
+    # Проверяем ожидание ввода для панели Евы
     pending_input = _pending_dashboard_input.pop(user_id, None)
     if pending_input:
         if message.text.startswith('/'):
-            # Пользователь передумал / прислал команду — отменяем ожидание
-            _pending_dashboard_input.pop(user_id, None)
             await message.answer("❌ Действие отменено — ожидание ввода сброшено.")
             return
         _, template = _DASHBOARD_INPUT[pending_input]
@@ -783,7 +946,6 @@ async def handle_text(message: Message):
         await handle_reminder_command(message)
         return
 
-    # Онлайн-ретрансляция к локальному мозгу (если агент на связи)
     from eva_engine import is_agent_online, relay_to_agent
     if is_agent_online(user_id):
         await relay_to_agent(message.bot, user_id, user_text, message.answer, "telegram")
@@ -795,7 +957,8 @@ async def handle_text(message: Message):
     answer = await get_ai_response(user_id, user_text)
     await message.answer(answer)
 
-# ----- Обработка напоминаний (внутренняя функция) -----
+
+# ----- Обработка напоминаний -----
 async def handle_reminder_command(message: Message):
     try:
         await _parse_and_save_reminder(message)
@@ -824,7 +987,8 @@ async def _parse_and_save_reminder(message: Message):
     tz_note = "" if tz_name != "UTC" else " (UTC — часовой пояс не настроен, отправь /timezone)"
     await message.answer(f"✅ Напомню **{result.reminder_text}** {when_label}{suffix}{tz_note}.")
 
-# ----- Обработка PDF -----
+
+# ----- Обработка файлов (PDF, Голосовые, Фото) -----
 @router.message(lambda msg: msg.document and msg.document.mime_type == "application/pdf")
 async def handle_pdf(message: Message):
     user_id = message.from_user.id
@@ -862,7 +1026,7 @@ async def handle_pdf(message: Message):
     await add_memory(user_id, memory_text, tag="документ")
     await message.answer(f"✅ Прочитал PDF **{file_name}** (символов: {len(text)}), сохранил в память.")
 
-# ----- Обработка голосовых -----
+
 @router.message(lambda msg: msg.voice is not None)
 async def handle_voice(message: Message):
     user_id = message.from_user.id
@@ -885,11 +1049,10 @@ async def handle_voice(message: Message):
     await add_memory(user_id, memory_text, tag="голосовое")
     await message.answer(f"🗣️ Распознал:\n\n{recognized_text}\n\n✅ Сохранил в память.")
 
-# ----- Обработка фото -----
+
 @router.message(lambda msg: msg.photo is not None)
 async def handle_photo(message: Message):
     user_id = message.from_user.id
-    # Берём фото в максимальном разрешении (последнее в списке размеров)
     photo = message.photo[-1]
 
     file = await message.bot.get_file(photo.file_id)

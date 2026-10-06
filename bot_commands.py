@@ -22,6 +22,7 @@ DEFAULT_COMMANDS = [
 # Добавляется одобренным пользователям бота
 BASE_COMMANDS = DEFAULT_COMMANDS + [
     BotCommand(command="status", description="Мой уровень доступа"),
+    BotCommand(command="dashboard", description="Дашборд задач To-Do"),
     BotCommand(command="memory", description="Последние записи в памяти"),
     BotCommand(command="digest", description="Дайджест памяти за сутки"),
     BotCommand(command="reminders", description="Список напоминаний"),
@@ -35,7 +36,7 @@ EVA_COMMANDS = [
     BotCommand(command="screenshot", description="Сделать скриншот экрана"),
     BotCommand(command="find", description="Найти файл или папку на компьютере"),
     BotCommand(command="open", description="Открыть файл или папку"),
-    BotCommand(command="dashboard", description="Панель управления Евой"),
+    BotCommand(command="eva_dashboard", description="Панель управления Евой (кнопки)"),
     BotCommand(command="agent_status", description="Подключён ли агент Евы"),
 ]
 
