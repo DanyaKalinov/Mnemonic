@@ -1,5 +1,6 @@
 import asyncio
 import os
+import random
 import tempfile
 from datetime import datetime, timezone
 from typing import Optional
@@ -153,8 +154,12 @@ def build_dashboard_keyboard(tasks: list[dict], filter_type: str = "all") -> Inl
 
     builder.row(
         InlineKeyboardButton(text="➕ Новая задача", callback_data="taskdash_add"),
-        InlineKeyboardButton(text="🧹 Очистить готовые", callback_data="taskdash_clear"),
+        InlineKeyboardButton(text="🔔 Напоминания", callback_data="taskdash_reminders"),
         InlineKeyboardButton(text="🔄 Обновить", callback_data=f"taskdash_refresh:{filter_type}")
+    )
+
+    builder.row(
+        InlineKeyboardButton(text="🧹 Очистить готовые", callback_data="taskdash_clear"),
     )
 
     return builder.as_markup()
@@ -242,14 +247,44 @@ async def cmd_start(message: Message):
 
 
 # ----- Хэндлеры Дашборда Задач (To-Do) -----
+# ----- Фразы Eva для действий с дашбордом -----
+_DASHBOARD_OPEN_PHRASES = [
+    "Загружаю твой список дел. Посмотрим, что у нас на сегодня!",
+    "Дашборд задач на экране. Давай сверимся с планами.",
+    "Сектора проверены, список обновлён. Вот твои актуальные задачи:",
+    "Показываю текущий прогресс. Что планируем делать дальше?",
+]
+
+_DASHBOARD_REFRESH_PHRASES = _DASHBOARD_OPEN_PHRASES
+
+_DASHBOARD_FILTER_PHRASES = {
+    "pending": "Оставила только активные задачи. Сосредоточимся на них.",
+    "completed": "Отличная работа! Вот список всего, что ты уже закрыл.",
+    "all": "Показываю полный список задач — и готовые, и в процессе.",
+}
+
+_DASHBOARD_TASK_TOGGLE_PHRASES = {
+    "complete": [
+        "Готово! Отметила задачу выполненной. Так держать!",
+        "Минус одна задача! Вычеркиваем.",
+        "Зафиксировано! На шаг ближе к закрытию всех дел.",
+    ],
+    "uncomplete": [
+        "Возвращаю задачу в список активных. Не страшно, доделаем!",
+        "Поняла, статус сброшен обратно на \"В работе\".",
+    ],
+}
+
+
 @router.message(Command("dashboard"))
 @router.message(F.text == "📊 Дашборд задач")
 async def show_dashboard_cmd(message: Message):
-    """Выводит дашборд задач."""
     tasks = await get_user_tasks(user_id=message.from_user.id)
     text = render_dashboard_text(tasks, "all")
     kb = build_dashboard_keyboard(tasks, "all")
     await message.answer(text=text, reply_markup=kb, parse_mode="HTML")
+    # Отправляем фразу Евы отдельным сообщением
+    await message.answer(random.choice(_DASHBOARD_OPEN_PHRASES))
 
 
 @router.callback_query(F.data.startswith("taskdash_filter:"))
@@ -262,6 +297,9 @@ async def handle_dashboard_filter(callback: CallbackQuery):
 
     await callback.message.edit_text(text=text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
+    # Отправляем фразу Евы отдельным сообщением
+    phrase = _DASHBOARD_FILTER_PHRASES.get(filter_type, "Фильтр применён.")
+    await callback.message.answer(phrase)
 
 
 @router.callback_query(F.data.startswith("taskdash_toggle:"))
@@ -270,14 +308,22 @@ async def handle_task_toggle(callback: CallbackQuery):
     task_id = int(parts[1])
     filter_type = parts[2]
 
-    await toggle_task_status(task_id=task_id)
+    new_status = await toggle_task_status(task_id=task_id)
+    if new_status is None:
+        await callback.answer("Задача не найдена!", show_alert=True)
+        return
 
     tasks = await get_user_tasks(user_id=callback.from_user.id)
     text = render_dashboard_text(tasks, filter_type)
     kb = build_dashboard_keyboard(tasks, filter_type)
 
     await callback.message.edit_text(text=text, reply_markup=kb, parse_mode="HTML")
-    await callback.answer("Статус обновлён!")
+    # Отправляем фразу Евы
+    if new_status == "completed":
+        phrase = random.choice(_DASHBOARD_TASK_TOGGLE_PHRASES["complete"])
+    else:
+        phrase = random.choice(_DASHBOARD_TASK_TOGGLE_PHRASES["uncomplete"])
+    await callback.message.answer(phrase)
 
 
 @router.callback_query(F.data == "taskdash_clear")
@@ -302,6 +348,23 @@ async def handle_refresh(callback: CallbackQuery):
 
     await callback.message.edit_text(text=text, reply_markup=kb, parse_mode="HTML")
     await callback.answer("Данные обновлены")
+    # Отправляем фразу Евы отдельным сообщением
+    await callback.message.answer(random.choice(_DASHBOARD_REFRESH_PHRASES))
+
+
+@router.callback_query(F.data == "taskdash_reminders")
+async def handle_task_reminders(callback: CallbackQuery):
+    """Настройка напоминаний о задачах."""
+    await callback.message.answer(
+        "🔔 <b>Настройка напоминаний о задачах</b>\n\n"
+        "Напиши, как часто напоминать о задачах. Например:\n"
+        "• <code>каждый день в 9:00</code>\n"
+        "• <code>каждый час</code>\n"
+        "• <code>каждую неделю в понедельник в 10:00</code>\n\n"
+        "Или напиши свой вариант расписания.",
+        parse_mode="HTML"
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data == "taskdash_add")
