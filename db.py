@@ -400,57 +400,136 @@ async def update_eva_command_status(
 
 # ----- Задачи (Tasks) -----
 async def create_tasks_table_if_not_exists() -> None:
-    """Создаёт таблицу задач tasks, если её ещё нет."""
+    """
+    Создаёт таблицу tasks и таблицу task_counters, если их ещё нет.
+    Выполняет бэкфилл user_seq для существующих строк.
+    Идемпотентна — безопасна при каждом запуске.
+    """
     async with get_pool().acquire() as conn:
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tasks (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                title TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                interval_minutes INT DEFAULT 0,
-                created_at TIMESTAMPTZ DEFAULT now()
-            );
-            """
-        )
+        async with conn.transaction():
+            # 1. Добавляем колонку user_seq, если её нет
+            await conn.execute(
+                """
+                ALTER TABLE tasks ADD COLUMN IF NOT EXISTS user_seq INT;
+                """
+            )
+
+            # 2. Создаём таблицу счётчиков пользователей, если её нет
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_counters (
+                    user_id BIGINT PRIMARY KEY,
+                    last_seq INT NOT NULL DEFAULT 0
+                );
+                """
+            )
+
+            # 3. Бэкфилл: назначаем user_seq там, где он NULL
+            # ROW_NUMBER() даёт 1,2,3... в порядке created_at, id
+            await conn.execute(
+                """
+                UPDATE tasks AS t
+                SET user_seq = sub.user_seq
+                FROM (
+                    SELECT id, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at, id) AS user_seq
+                    FROM tasks
+                ) AS sub
+                WHERE t.id = sub.id AND t.user_seq IS NULL;
+                """
+            )
+
+            # 4. Синхронизируем task_counters.last_seq = MAX(user_seq) по пользователю
+            # UPSERT: вставляем новых, обновляем существующих
+            await conn.execute(
+                """
+                INSERT INTO task_counters (user_id, last_seq)
+                SELECT user_id, MAX(user_seq)
+                FROM tasks
+                GROUP BY user_id
+                ON CONFLICT (user_id) DO UPDATE SET last_seq = EXCLUDED.last_seq;
+                """
+            )
+
+            # 5. Создаём уникальный индекс на (user_id, user_seq)
+            await conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS tasks_user_seq_uidx
+                ON tasks (user_id, user_seq);
+                """
+            )
 
 
 async def add_single_task(user_id: int, title: str) -> int:
-    """Добавляет одну задачу для пользователя."""
+    """
+    Добавляет одну задачу для пользователя.
+    Атомарно получает следующий user_seq из task_counters.
+    Возвращает user_seq (номер задачи для пользователя).
+    """
     async with get_pool().acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO tasks (user_id, title)
-            VALUES ($1, $2)
-            RETURNING id
-            """,
-            user_id, title,
-        )
-    return row["id"]
+        async with conn.transaction():
+            # Получаем следующий номер атомарно
+            row = await conn.fetchrow(
+                """
+                INSERT INTO task_counters (user_id, last_seq)
+                VALUES ($1, 1)
+                ON CONFLICT (user_id) DO UPDATE SET last_seq = task_counters.last_seq + 1
+                RETURNING last_seq
+                """,
+                user_id,
+            )
+            user_seq = row["last_seq"]
+
+            # Вставляем задачу с полученным номером
+            await conn.execute(
+                """
+                INSERT INTO tasks (user_id, title, user_seq)
+                VALUES ($1, $2, $3)
+                """,
+                user_id, title, user_seq,
+            )
+    return user_seq
 
 
 async def add_tasks_batch(user_id: int, tasks_titles: list[str], interval_minutes: int = 0) -> list[int]:
-    """Массово добавляет список задач."""
+    """
+    Массово добавляет список задач.
+    Атомарно получает следующие user_seq из task_counters для каждой задачи.
+    Возвращает список user_seq (номера задач для пользователя).
+    """
     async with get_pool().acquire() as conn:
-        query = """
-            INSERT INTO tasks (user_id, title, interval_minutes)
-            VALUES ($1, $2, $3)
-            RETURNING id
-        """
-        inserted_ids = []
-        for title in tasks_titles:
-            row = await conn.fetchrow(query, user_id, title, interval_minutes)
-            inserted_ids.append(row["id"])
-        return inserted_ids
+        async with conn.transaction():
+            inserted_seqs = []
+            for title in tasks_titles:
+                # Получаем следующий номер атомарно
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO task_counters (user_id, last_seq)
+                    VALUES ($1, 1)
+                    ON CONFLICT (user_id) DO UPDATE SET last_seq = task_counters.last_seq + 1
+                    RETURNING last_seq
+                    """,
+                    user_id,
+                )
+                user_seq = row["last_seq"]
+
+                # Вставляем задачу с полученным номером
+                await conn.execute(
+                    """
+                    INSERT INTO tasks (user_id, title, interval_minutes, user_seq)
+                    VALUES ($1, $2, $3, $4)
+                    """,
+                    user_id, title, interval_minutes, user_seq,
+                )
+                inserted_seqs.append(user_seq)
+            return inserted_seqs
 
 
 async def get_user_tasks(user_id: int) -> list[dict]:
-    """Возвращает все задачи пользователя."""
+    """Возвращает все задачи пользователя с их user_seq."""
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, user_id, title, status, interval_minutes, created_at
+            SELECT id, user_id, title, status, interval_minutes, created_at, user_seq
             FROM tasks
             WHERE user_id = $1
             ORDER BY created_at DESC
@@ -460,22 +539,38 @@ async def get_user_tasks(user_id: int) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-async def toggle_task_status(task_id: int) -> Optional[str]:
-    """Переключает статус задачи с pending на completed и наоборот."""
+async def toggle_task_status(user_id: int, user_seq: int) -> Optional[str]:
+    """
+    Переключает статус задачи с pending на completed и наоборот.
+    Использует (user_id, user_seq) вместо глобального id — это закрывает дыру,
+    когда чужую задачу можно переключить подделанным callback.
+    Возвращает новый статус или None, если задача не найдена.
+    """
     async with get_pool().acquire() as conn:
-        row = await conn.fetchrow("SELECT status FROM tasks WHERE id = $1", task_id)
+        row = await conn.fetchrow(
+            "SELECT status FROM tasks WHERE user_id = $1 AND user_seq = $2",
+            user_id, user_seq,
+        )
         if not row:
             return None
         new_status = "completed" if row["status"] == "pending" else "pending"
-        await conn.execute("UPDATE tasks SET status = $2 WHERE id = $1", task_id, new_status)
+        await conn.execute(
+            "UPDATE tasks SET status = $3 WHERE user_id = $1 AND user_seq = $2",
+            user_id, user_seq, new_status,
+        )
     return new_status
 
 
-async def edit_task_title(task_id: int, new_title: str) -> bool:
-    """Обновляет название задачи."""
+async def edit_task_title(user_id: int, user_seq: int, new_title: str) -> bool:
+    """
+    Обновляет название задачи.
+    Использует (user_id, user_seq) вместо глобального id — безопасность.
+    Возвращает True, если задача обновлена.
+    """
     async with get_pool().acquire() as conn:
         result = await conn.execute(
-            "UPDATE tasks SET title = $2 WHERE id = $1", task_id, new_title
+            "UPDATE tasks SET title = $3 WHERE user_id = $1 AND user_seq = $2",
+            user_id, user_seq, new_title,
         )
     return int(result.split()[-1]) > 0
 

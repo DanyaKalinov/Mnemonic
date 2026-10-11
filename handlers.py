@@ -104,15 +104,17 @@ def render_dashboard_text(tasks: list[dict], filter_type: str = "all") -> str:
         return summary + "\n\n🎉 <i>Задач в этой категории нет!</i>"
 
     task_lines = []
-    for idx, task in enumerate(filtered):
+    for task in filtered:
         is_done = task.get('status') == 'completed'
         status_icon = "✅" if is_done else "⏳"
         title = task['title']
+        user_seq = task.get('user_seq', '?')
 
         if is_done:
             title = f"<s>{title}</s>"
 
-        task_lines.append(f"{idx + 1}. {status_icon} #{task['id']} — {title}")
+        # Один стабильный номер на пользователя: #1, #2, #3...
+        task_lines.append(f"{status_icon} #{user_seq} — {title}")
 
     return summary + "\n\n" + "\n".join(task_lines)
 
@@ -145,10 +147,12 @@ def build_dashboard_keyboard(tasks: list[dict], filter_type: str = "all") -> Inl
     for task in filtered:
         is_done = task.get('status') == 'completed'
         btn_icon = "↩️ Вернуть" if is_done else "✅ Сделать"
+        user_seq = task.get('user_seq', '?')
         builder.row(
             InlineKeyboardButton(
-                text=f"{btn_icon} #{task['id']}",
-                callback_data=f"taskdash_toggle:{task['id']}:{filter_type}"
+                text=f"{btn_icon} #{user_seq}",
+                # Новый префикс taskdash_t: использует user_seq вместо id
+                callback_data=f"taskdash_t:{user_seq}:{filter_type}"
             )
         )
 
@@ -302,18 +306,23 @@ async def handle_dashboard_filter(callback: CallbackQuery):
     await callback.message.answer(phrase)
 
 
-@router.callback_query(F.data.startswith("taskdash_toggle:"))
+@router.callback_query(F.data.startswith("taskdash_t:"))
 async def handle_task_toggle(callback: CallbackQuery):
+    """
+    Переключает статус задачи по user_seq.
+    Новый формат: taskdash_t:<user_seq>:<filter_type>
+    """
     parts = callback.data.split(":")
-    task_id = int(parts[1])
+    user_seq = int(parts[1])
     filter_type = parts[2]
+    user_id = callback.from_user.id
 
-    new_status = await toggle_task_status(task_id=task_id)
+    new_status = await toggle_task_status(user_id=user_id, user_seq=user_seq)
     if new_status is None:
         await callback.answer("Задача не найдена!", show_alert=True)
         return
 
-    tasks = await get_user_tasks(user_id=callback.from_user.id)
+    tasks = await get_user_tasks(user_id=user_id)
     text = render_dashboard_text(tasks, filter_type)
     kb = build_dashboard_keyboard(tasks, filter_type)
 
@@ -324,6 +333,16 @@ async def handle_task_toggle(callback: CallbackQuery):
     else:
         phrase = random.choice(_DASHBOARD_TASK_TOGGLE_PHRASES["uncomplete"])
     await callback.message.answer(phrase)
+
+
+@router.callback_query(F.data.startswith("taskdash_toggle:"))
+async def handle_task_toggle_legacy(callback: CallbackQuery):
+    """
+    Заглушка для старого формата callback_data (taskdash_toggle:<id>:<filter>).
+    В чате остались старые сообщения с глобальным id в callback_data.
+    Данные не меняем — только предупреждаем пользователя.
+    """
+    await callback.answer("Дашборд устарел, открой заново: /dashboard", show_alert=True)
 
 
 @router.callback_query(F.data == "taskdash_clear")
