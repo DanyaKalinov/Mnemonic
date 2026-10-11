@@ -28,12 +28,12 @@ from db import (
     set_user_role, is_owner, get_eva_command, update_eva_command_status,
     can_use_eva, set_eva_access, list_owner_ids, list_eva_access_users,
     get_user_tasks, toggle_task_status, add_single_task, add_tasks_batch, clear_completed_tasks,
-    set_user_setting_key, get_users_with_task_reminders
+    set_user_setting_key,
 )
 from reminder_parser import parse_reminder_text
 from task_reminder_parser import (
-    parse_task_reminder_text, compute_next_run, TaskReminderSchedule,
-    DEFAULT_QUIET_START, DEFAULT_QUIET_END
+    parse_task_reminder_text, is_task_reminder_intent,
+    build_task_reminders_config, describe_task_reminders,
 )
 from memory import add_memory
 from ai_core import get_ai_response, describe_image, transcribe_voice, summarize_for_digest
@@ -381,76 +381,36 @@ async def handle_refresh(callback: CallbackQuery):
     await callback.message.answer(random.choice(_DASHBOARD_REFRESH_PHRASES))
 
 
-async def format_task_reminder_status(user: dict) -> str:
-    """Формирует текст текущего статуса напоминаний о задачах."""
-    settings = (user.get("settings") or {}).get("task_reminders") or {}
-    if not settings.get("enabled"):
-        return "🔔 <b>Напоминания о задачах выключены</b>\n\n" \
-               "Напиши расписание, например:\n" \
-               "• <code>каждые 2 часа</code>\n" \
-               "• <code>каждый день в 9:00</code>\n" \
-               "• <code>каждую неделю в понедельник в 10:00</code>"
+_TASK_REMINDER_HINT = (
+    "📝 <b>Как часто напоминать?</b>\n"
+    "Напиши расписание или «выключи»:\n"
+    "• <code>каждые 2 часа</code>\n"
+    "• <code>каждый день в 9:00</code>\n"
+    "• <code>каждую неделю в понедельник в 10:00</code>\n"
+    "• <code>тихие часы с 23:00 до 7:00</code>\n"
+    "• <code>выключи</code>\n"
+    "Для выхода напиши «отмена»."
+)
 
-    kind = settings.get("kind")
-    time_str = ""
-    if kind == "interval":
-        time_str = f"каждые {settings.get('interval_minutes', 0)} минут"
-    elif kind == "daily":
-        t = settings.get("time")
-        if t:
-            time_str = f"каждый день в {t['hour']:02d}:{t['minute']:02d}"
-    elif kind == "weekly":
-        t = settings.get("time")
-        weekday = settings.get("weekday")
-        weekdays = ["понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье"]
-        day_name = weekdays[weekday] if weekday is not None else "неизвестный день"
-        if t:
-            time_str = f"каждую {day_name} в {t['hour']:02d}:{t['minute']:02d}"
 
-    quiet_enabled = settings.get("quiet_enabled", True)
-    if quiet_enabled:
-        qs = settings.get("quiet_start", {})
-        qe = settings.get("quiet_end", {})
-        quiet_str = f" (тихие часы {qs.get('hour', 22):02d}:{qs.get('minute', 0):02d}–{qe.get('hour', 8):02d}:{qe.get('minute', 0):02d})"
-    else:
-        quiet_str = " (тихие часы выключены)"
-
-    next_run = settings.get("next_run_at", "неизвестно")
-    if isinstance(next_run, str):
-        next_run = next_run[:16].replace("T", " ") if next_run else "неизвестно"
-
-    return (
-        f"🔔 <b>Напоминания о задачах включены</b>\n"
-        f"Расписание: <b>{time_str}</b>{quiet_str}\n"
-        f"Ближайшее напоминание: <b>{next_run}</b>\n\n"
-        "Напиши новое расписание или «выключи», чтобы отключить."
-    )
+def _user_tz_and_reminders(user: dict) -> tuple[str, dict]:
+    settings = (user.get("settings") or {}) if user else {}
+    cfg = settings.get("task_reminders") or {}
+    return settings.get("timezone") or "UTC", cfg
 
 
 @router.callback_query(F.data == "taskdash_reminders")
 async def handle_task_reminders(callback: CallbackQuery, state: FSMContext):
-    """Настройка напоминаний о задачах через FSM."""
+    """Кнопка 🔔: показывает текущие настройки и включает режим ожидания расписания."""
     user = await get_user(callback.from_user.id)
     if user is None:
         await callback.answer("Пользователь не найден.")
         return
 
-    # Показываем текущий статус
-    status_text = await format_task_reminder_status(user)
-    await callback.message.answer(status_text, parse_mode="HTML")
-
-    # Выводим подсказку и переводим в состояние ожидания
-    await callback.message.answer(
-        "📝 <b>Как часто напоминать?</b>\n"
-        "Напиши расписание или «выключи»:\n"
-        "• <code>каждые 2 часа</code>\n"
-        "• <code>каждый день в 9:00</code>\n"
-        "• <code>каждую неделю в понедельник в 10:00</code>\n"
-        "• <code>тихие часы с 23:00 до 7:00</code>\n"
-        "• <code>выключи</code>",
-        parse_mode="HTML",
-        reply_markup=ReplyKeyboardRemove()
-    )
+    tz_name, cfg = _user_tz_and_reminders(user)
+    status_text = describe_task_reminders(cfg, tz_name, "status") if cfg else \
+        "🔔 <b>Напоминания о задачах выключены.</b>"
+    await callback.message.answer(status_text + "\n\n" + _TASK_REMINDER_HINT, parse_mode="HTML")
 
     await state.set_state(TaskReminderStates.waiting_for_schedule)
     await callback.answer()
@@ -494,124 +454,45 @@ async def handle_task_input(message: Message, state: FSMContext):
 # ----- Обработка состояния настройки напоминаний о задачах -----
 
 @router.message(TaskReminderStates.waiting_for_schedule)
-async def handle_task_reminder_schedule(message: Message, state: FSMContext, bot: Bot):
-    """Обработчик текста в состоянии ожидания расписания напоминаний."""
+async def handle_task_reminder_schedule(message: Message, state: FSMContext, bot: Optional[Bot] = None):
+    """
+    Разбирает фразу про расписание и сохраняет настройку.
+    Вызывается и из режима ожидания (после кнопки 🔔), и напрямую из handle_text.
+    """
     user_id = message.from_user.id
-    text = message.text.strip()
+    text = (message.text or "").strip()
 
-    # Выход из состояния: команда или слово "отмена"
-    if text.startswith("/") or text.lower() == "отмена":
+    if not text:
+        await message.answer("Напиши расписание текстом, например: «каждые 2 часа».")
+        return
+
+    # Выход из режима: слово «отмена» (команды /... обрабатываются раньше отдельными хендлерами)
+    if text.startswith("/") or text.lower() in ("отмена", "отменить", "cancel"):
         await state.clear()
         await message.answer("❌ Действие отменено.")
         return
 
-    # Парсим текст
     result = parse_task_reminder_text(text)
-
     if not result.ok:
-        # Показываем ошибку с примерами и остаёмся в состоянии
-        await message.answer(
-            f"❌ {result.error}",
-            parse_mode="HTML"
-        )
+        # Остаёмся (или входим) в режим ожидания, чтобы следующий ответ тоже разобрался как расписание
+        await state.set_state(TaskReminderStates.waiting_for_schedule)
+        await message.answer(result.error, parse_mode="HTML")
         return
 
-    # Получаем настройки пользователя
     user = await get_user(user_id)
     if user is None:
         await state.clear()
         await message.answer("❌ Пользователь не найден.")
         return
 
-    tz_name = (user.get("settings") or {}).get("timezone") or "UTC"
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = ZoneInfo("UTC")
+    tz_name, existing = _user_tz_and_reminders(user)
 
-    now_utc = datetime.now(timezone.utc)
-
-    # Обрабатываем action
-    cfg = TaskReminderSchedule(
-        kind=result.kind,
-        interval_minutes=result.interval_minutes,
-        time=result.time,
-        weekday=result.weekday,
-    )
-
-    # Вычисляем next_run_at
-    quiet_start = result.quiet_start if result.quiet_start else DEFAULT_QUIET_START
-    quiet_end = result.quiet_end if result.quiet_end else DEFAULT_QUIET_END
-
-    if result.kind == "interval":
-        next_run = compute_next_run(cfg, tz_name, now_utc, quiet_start, quiet_end)
-    else:
-        next_run = compute_next_run(cfg, tz_name, now_utc)
-
-    # Формируем настройки для сохранения
-    task_reminders = {
-        "enabled": result.action != "disable" and result.action != "quiet_off",
-        "kind": result.kind,
-        "interval_minutes": result.interval_minutes,
-        "time": {
-            "hour": result.time.hour,
-            "minute": result.time.minute,
-        } if result.time else None,
-        "weekday": result.weekday,
-        "quiet_enabled": result.action != "quiet_off",
-        "quiet_start": {
-            "hour": result.quiet_start.hour,
-            "minute": result.quiet_start.minute,
-        } if result.quiet_start else {"hour": 22, "minute": 0},
-        "quiet_end": {
-            "hour": result.quiet_end.hour,
-            "minute": result.quiet_end.minute,
-        } if result.quiet_end else {"hour": 8, "minute": 0},
-        "next_run_at": next_run.isoformat(),
-    }
-
-    if result.action == "disable":
-        task_reminders["enabled"] = False
-    elif result.action == "quiet_off":
-        task_reminders["quiet_enabled"] = False
-
-    # Сохраняем настройки точечной записью (не затираем timezone и др.)
-    await set_user_setting_key(user_id, "task_reminders", task_reminders)
-
-    # Формируем ответ
-    if result.action == "disable":
-        await state.clear()
-        await message.answer("🔔 Напоминания о задачах отключены.")
-        return
-
-    # Формируем человекочитаемое описание
-    kind_desc = ""
-    if result.kind == "interval":
-        kind_desc = f"каждые {result.interval_minutes} минут"
-    elif result.kind == "daily":
-        kind_desc = f"каждый день в {result.time.hour:02d}:{result.time.minute:02d}"
-    elif result.kind == "weekly":
-        weekdays = ["понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье"]
-        day_name = weekdays[result.weekday] if result.weekday is not None else "неизвестный день"
-        kind_desc = f"каждую {day_name} в {result.time.hour:02d}:{result.time.minute:02d}"
-
-    quiet_str = ""
-    if result.quiet_enabled or result.action != "quiet_off":
-        qs = result.quiet_start or time(22, 0)
-        qe = result.quiet_end or time(8, 0)
-        quiet_str = f", кроме {qs.hour:02d}:{qs.minute:02d}–{qe.hour:02d}:{qe.minute:02d}"
-
-    # Проверяем, настроен ли часовой пояс
-    tz_note = ""
-    if tz_name == "UTC":
-        tz_note = "\n\n🌍 <b>Важно:</b> часовой пояс не настроен (UTC). Отправь /timezone, чтобы напоминания приходили по твоему местному времени."
+    # Накладываем изменение на текущий конфиг — ничего не затираем
+    new_cfg = build_task_reminders_config(existing, result, tz_name, datetime.now(timezone.utc))
+    await set_user_setting_key(user_id, "task_reminders", new_cfg)
 
     await state.clear()
-    local_next = next_run.astimezone(tz)
-    await message.answer(
-        f"🔔 Буду напоминать {kind_desc}{quiet_str}. Ближайшее — в {local_next.strftime('%H:%M')}.{tz_note}",
-        parse_mode="HTML"
-    )
+    await message.answer(describe_task_reminders(new_cfg, tz_name, result.action), parse_mode="HTML")
 
 
 # ----- Обработка одобрений и остальной функционал -----
@@ -1214,40 +1095,19 @@ async def handle_text(message: Message, state: FSMContext):
         await message.answer("❓ Неизвестная команда. Напиши /help.")
         return
 
-    # Проверяем FSM состояние настройки напоминаний о задачах
+    # Режим ожидания расписания напоминаний о задачах (после кнопки 🔔)
     current_state = await state.get_state()
     if current_state == TaskReminderStates.waiting_for_schedule.state:
         await handle_task_reminder_schedule(message, state, message.bot)
         return
 
     user_text = message.text
-
     lower_text = user_text.lower()
 
-    # Распознаём интент: слово "задач*" + "напомин*/не напоминай" ИЛИ "тихие часы"
-    # Это позволяет использовать фразы без кнопки дашборда
-    task_reminder_keywords = [
-        r'задач', r'напомин', r'не напоминай',
-        r'тихие часы', r'тихий час', r'не беспокой',
-    ]
-
-    # Проверяем, содержит ли текст ключевые слова для настроек напоминаний о задачах
-    import re
-    has_task_reminder_intent = any(re.search(pattern, lower_text) for pattern in task_reminder_keywords)
-
-    if has_task_reminder_intent:
-        # Передаём в обработчик напоминаний о задачах (через FSM)
-        await state.set_state(TaskReminderStates.waiting_for_schedule)
-        await message.answer(
-            "🔔 <b>Настройка напоминаний о задачах</b>\n"
-            "Напиши расписание или «выключи»:\n"
-            "• <code>каждые 2 часа</code>\n"
-            "• <code>каждый день в 9:00</code>\n"
-            "• <code>каждую неделю в понедельник в 10:00</code>\n"
-            "• <code>тихие часы с 23:00 до 7:00</code>\n"
-            "• <code>выключи</code>",
-            parse_mode="HTML"
-        )
+    # Фраза про напоминания О ЗАДАЧАХ без кнопки («напоминай мне о моих задачах каждые 2 часа»).
+    # Правило узкое (см. is_task_reminder_intent), чтобы обычные «напомни …» работали как раньше.
+    if is_task_reminder_intent(user_text):
+        await handle_task_reminder_schedule(message, state, message.bot)
         return
 
     if lower_text.startswith("напомни") or lower_text.startswith("напоминай"):

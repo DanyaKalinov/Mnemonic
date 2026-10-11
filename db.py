@@ -161,21 +161,50 @@ async def set_user_status(user_id: int, status: str) -> None:
 
 async def set_user_setting_key(user_id: int, key: str, value) -> bool:
     """
-    Точечная запись в settings пользователя через jsonb_set.
+    Точечная запись одного ключа в settings через jsonb_set.
     Не затирает остальные ключи (timezone и др.), безопасна при гонках с фоновым циклом.
     """
-    import json
-    value_json = json.dumps(value)
+    value_json = json.dumps(value, ensure_ascii=False)
     async with get_pool().acquire() as conn:
         result = await conn.execute(
             """
             UPDATE users
-            SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), %s, %s::jsonb, true)
-            WHERE user_id = %s
+            SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), ARRAY[$2::text], $3::jsonb, true)
+            WHERE user_id = $1
             """,
-            f"{{\"{key}\"}}", value_json, user_id,
+            user_id, key, value_json,
         )
     return int(result.split()[-1]) > 0
+
+
+async def claim_task_reminder_run(user_id: int, old_next_run: str, new_next_run: str) -> bool:
+    """
+    «Занимает» запуск напоминания: атомарно меняет next_run_at, только если он ещё равен old_next_run.
+    Если два экземпляра бота (деплой на Render) работают одновременно — сообщение уйдёт только из одного.
+    """
+    async with get_pool().acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE users
+            SET settings = jsonb_set(settings, '{task_reminders,next_run_at}', to_jsonb($3::text), true)
+            WHERE user_id = $1 AND settings->'task_reminders'->>'next_run_at' = $2
+            """,
+            user_id, old_next_run, new_next_run,
+        )
+    return int(result.split()[-1]) > 0
+
+
+async def disable_task_reminders(user_id: int) -> None:
+    """Выключает напоминания о задачах (например, если пользователь заблокировал бота)."""
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE users
+            SET settings = jsonb_set(settings, '{task_reminders,enabled}', 'false'::jsonb, true)
+            WHERE user_id = $1 AND settings ? 'task_reminders'
+            """,
+            user_id,
+        )
 
 
 async def get_users_with_task_reminders() -> list[dict]:

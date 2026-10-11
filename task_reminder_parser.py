@@ -128,8 +128,8 @@ def parse_task_reminder_text(text: str) -> TaskReminderParseResult:
     work = text.strip().lower()
 
     # --- Сначала проверяем выключение тихих часов (до общих паттернов отключения) ---
-    if re.search(r'тих(?:ие|ий)\s+час(?:ы|а)?\s*(?:выключи|отключи)', work) or \
-       re.search(r'(?:выключи|отключи)\s+тих(?:ие|ий)\s+час', work):
+    if re.search(r'тих(?:ие|ий)\s+час\w*\s*(?:выключ\w*|отключ\w*)', work) or \
+       re.search(r'(?:выключ\w*|отключ\w*)\s+тих(?:ие|ий)\s+час', work):
         return TaskReminderParseResult(action="quiet_off")
 
     # --- Проверяем установку тихих часов ---
@@ -161,9 +161,10 @@ def parse_task_reminder_text(text: str) -> TaskReminderParseResult:
             )
 
     # --- Проверяем отключение напоминаний о задачах ---
-    if re.search(r'выключи\s+напоминани[яе]?\s+о\s+задач', work) or \
-       re.search(r'отключи\s+напоминани[яе]?\s+о\s+задач', work) or \
-       re.search(r'не\s+напомина[йя]\s+о\s+задач', work):
+    # Голое «выключи / отключи / стоп» (в режиме ожидания расписания) тоже считаем выключением.
+    if re.fullmatch(r'(?:выключ\w*|отключ\w*|стоп|хватит)[.!]?', work) or \
+       re.search(r'(?:выключ\w*|отключ\w*|останов\w*|прекрат\w*)\s+(?:все\s+)?напоминани\w*.*задач', work) or \
+       re.search(r'(?:не|хватит)\s+напомин\w*.*задач', work):
         return TaskReminderParseResult(action="disable")
 
     # --- Проверяем интервалы (порядок важен: более специфичные первыми) ---
@@ -212,7 +213,7 @@ def parse_task_reminder_text(text: str) -> TaskReminderParseResult:
     # "каждую неделю в понедельник" или "каждый понедельник"
     weekly_match = re.search(
         r'(?:кажд(?:ый|ую|ое)\s+(?:неделю\s+в\s+)?)?'  # опционально "каждую неделю в"
-        r'(понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресень[ея])'
+        r'(понедельник\w*|вторник\w*|сред[ауы]\w*|четверг\w*|пятниц\w*|суббот\w*|воскресень\w*)'
         r'(?:\s+в\s+(\d{1,2})(?:[:.](\d{2}))?)?',
         work
     )
@@ -277,10 +278,10 @@ def _is_in_quiet_hours(dt: datetime, quiet_start: time, quiet_end: time) -> bool
 
     # Тихие часы НЕ переходят через полночь
     if quiet_start <= quiet_end:
-        return quiet_start <= current <= quiet_end
+        return quiet_start <= current < quiet_end
 
     # Тихие часы ПЕРЕХОДЯТ через полночь (22:00-08:00)
-    return current >= quiet_start or current <= quiet_end
+    return current >= quiet_start or current < quiet_end
 
 
 def compute_next_run(
@@ -315,7 +316,8 @@ def compute_next_run(
     # --- Interval: now + interval ---
     if cfg.kind == "interval":
         interval = timedelta(minutes=cfg.interval_minutes or 60)
-        next_run = now_local + interval
+        # Прибавляем в UTC: арифметика по локальному времени «ломается» при переходе на летнее/зимнее время
+        next_run = (now_utc + interval).astimezone(tz)
 
         # Если попали в тихие часы — сдвигаем на конец
         if quiet_start and quiet_end and _is_in_quiet_hours(next_run, quiet_start, quiet_end):
@@ -324,7 +326,7 @@ def compute_next_run(
             if quiet_end <= quiet_start:
                 # 22:00-08:00 → конец в 08:00 следующего дня
                 quiet_end_dt = next_run.replace(
-                    hour=quiet_end.hour, minute=quiet_end.minute
+                    hour=quiet_end.hour, minute=quiet_end.minute, second=0, microsecond=0
                 )
                 if quiet_end_dt <= next_run:
                     quiet_end_dt += timedelta(days=1)
@@ -332,7 +334,7 @@ def compute_next_run(
             else:
                 # Обычный диапазон (09:00-18:00) — сдвигаем на конец диапазона
                 next_run = next_run.replace(
-                    hour=quiet_end.hour, minute=quiet_end.minute
+                    hour=quiet_end.hour, minute=quiet_end.minute, second=0, microsecond=0
                 )
                 # Если конец уже прошёл сегодня — на завтра
                 if next_run <= now_local:
@@ -382,3 +384,199 @@ def compute_next_run(
 
     # Неизвестный kind — возвращаем now как fallback
     return now_utc
+
+
+# --- Распознавание намерения «настроить напоминания о задачах» ---
+
+_INTENT_PATTERNS = [
+    # «напоминай мне о (моих) задачах ...»
+    r'напомин\w*\s+(?:мне\s+)?(?:про|о|об)\s+(?:моих\s+|всех\s+|своих\s+|текущих\s+)?задач',
+    # «выключи напоминания о задачах», «не напоминай о задачах», «хватит напоминать о задачах»
+    r'(?:выключ\w*|отключ\w*|останов\w*|прекрат\w*)\s+(?:все\s+)?напоминани\w*.*задач',
+    r'(?:не|хватит)\s+напомин\w*.*задач',
+    # тихие часы
+    r'тих(?:ие|ий)\s+час',
+    r'не\s+беспоко\w+\s+(?:с\s+)?\d',
+]
+
+
+def is_task_reminder_intent(text: str) -> bool:
+    """
+    True, если фраза — про настройку напоминаний О ЗАДАЧАХ (а не обычное «напомни позвонить маме»).
+    Намеренно узкое правило: лучше пропустить редкую формулировку, чем сломать обычные напоминания.
+    """
+    if not text:
+        return False
+    work = text.strip().lower()
+    return any(re.search(pat, work) for pat in _INTENT_PATTERNS)
+
+
+# --- Конфиг напоминаний (хранится в users.settings["task_reminders"]) ---
+
+WEEKDAY_PHRASES = [
+    "каждый понедельник", "каждый вторник", "каждую среду", "каждый четверг",
+    "каждую пятницу", "каждую субботу", "каждое воскресенье",
+]
+
+
+def _t_to_dict(t: Optional[time]) -> Optional[dict]:
+    return {"hour": t.hour, "minute": t.minute} if t else None
+
+
+def _dict_to_t(d: Optional[dict]) -> Optional[time]:
+    if not d:
+        return None
+    try:
+        return time(int(d["hour"]), int(d["minute"]))
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def _fmt_t(t: time) -> str:
+    return f"{t.hour:02d}:{t.minute:02d}"
+
+
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    """Склонение: 1 час, 2 часа, 5 часов."""
+    n10, n100 = n % 10, n % 100
+    if n10 == 1 and n100 != 11:
+        return one
+    if 2 <= n10 <= 4 and not 12 <= n100 <= 14:
+        return few
+    return many
+
+
+def _describe_schedule(cfg: dict) -> str:
+    kind = cfg.get("kind")
+    if kind == "interval":
+        m = int(cfg.get("interval_minutes") or 0)
+        if m % 60 == 0:
+            h = m // 60
+            return "каждый час" if h == 1 else f"каждые {h} {_plural(h, 'час', 'часа', 'часов')}"
+        return f"каждые {m} {_plural(m, 'минуту', 'минуты', 'минут')}"
+    t = _dict_to_t(cfg.get("time")) or time(9, 0)
+    if kind == "daily":
+        return f"каждый день в {_fmt_t(t)}"
+    if kind == "weekly":
+        wd = cfg.get("weekday")
+        day = WEEKDAY_PHRASES[wd] if wd is not None and 0 <= wd <= 6 else "каждую неделю"
+        return f"{day} в {_fmt_t(t)}"
+    return "по расписанию"
+
+
+def default_task_reminders_config() -> dict:
+    return {
+        "enabled": False, "kind": None, "interval_minutes": None, "time": None, "weekday": None,
+        "quiet_enabled": True,
+        "quiet_start": _t_to_dict(DEFAULT_QUIET_START),
+        "quiet_end": _t_to_dict(DEFAULT_QUIET_END),
+        "next_run_at": None,
+    }
+
+
+def next_run_from_config(cfg: dict, tz_name: str, now_utc: datetime) -> datetime:
+    """Следующий запуск (UTC) по сохранённому конфигу. Используется и обработчиком, и фоновым циклом."""
+    schedule = TaskReminderSchedule(
+        kind=cfg["kind"],
+        interval_minutes=cfg.get("interval_minutes"),
+        time=_dict_to_t(cfg.get("time")),
+        weekday=cfg.get("weekday"),
+    )
+    quiet_start = quiet_end = None
+    # Тихие часы действуют только на интервальные напоминания: время daily/weekly пользователь задал сам.
+    if cfg.get("quiet_enabled", True) and cfg["kind"] == "interval":
+        quiet_start = _dict_to_t(cfg.get("quiet_start")) or DEFAULT_QUIET_START
+        quiet_end = _dict_to_t(cfg.get("quiet_end")) or DEFAULT_QUIET_END
+    return compute_next_run(schedule, tz_name, now_utc, quiet_start, quiet_end)
+
+
+def build_task_reminders_config(
+    existing: Optional[dict], result: TaskReminderParseResult, tz_name: str, now_utc: datetime
+) -> dict:
+    """
+    Накладывает результат разбора на ТЕКУЩИЙ конфиг, ничего не затирая:
+    смена тихих часов не сбрасывает расписание, «тихие часы выключи» не выключает напоминания.
+    """
+    cfg = {**default_task_reminders_config(), **(existing or {})}
+
+    if result.action == "set":
+        cfg.update(
+            enabled=True, kind=result.kind, interval_minutes=result.interval_minutes,
+            time=_t_to_dict(result.time), weekday=result.weekday,
+        )
+    elif result.action == "disable":
+        cfg["enabled"] = False
+    elif result.action == "quiet_set":
+        cfg.update(
+            quiet_enabled=True,
+            quiet_start=_t_to_dict(result.quiet_start),
+            quiet_end=_t_to_dict(result.quiet_end),
+        )
+    elif result.action == "quiet_off":
+        cfg["quiet_enabled"] = False
+
+    if cfg["enabled"] and cfg.get("kind"):
+        cfg["next_run_at"] = next_run_from_config(cfg, tz_name, now_utc).isoformat()
+    else:
+        cfg["next_run_at"] = None
+    return cfg
+
+
+def _human_when(next_run_utc: datetime, tz_name: str, now_utc: datetime) -> str:
+    from zoneinfo import ZoneInfo
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    local = next_run_utc.astimezone(tz)
+    today = now_utc.astimezone(tz).date()
+    if local.date() == today:
+        day = "сегодня"
+    elif (local.date() - today).days == 1:
+        day = "завтра"
+    else:
+        day = local.strftime("%d.%m")
+    return f"{day} в {local.strftime('%H:%M')}"
+
+
+def describe_task_reminders(cfg: dict, tz_name: str, action: str = "status", now_utc: Optional[datetime] = None) -> str:
+    """Текст (HTML) для пользователя: статус или подтверждение после изменения настройки."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    enabled = bool(cfg.get("enabled")) and bool(cfg.get("kind"))
+    quiet_on = cfg.get("quiet_enabled", True)
+    qs = _dict_to_t(cfg.get("quiet_start")) or DEFAULT_QUIET_START
+    qe = _dict_to_t(cfg.get("quiet_end")) or DEFAULT_QUIET_END
+    quiet_txt = f"{_fmt_t(qs)}–{_fmt_t(qe)}"
+
+    lines = []
+    if action == "disable":
+        lines.append("🔕 Напоминания о задачах выключены.")
+    elif action == "quiet_off":
+        lines.append("🌙 Тихие часы выключены.")
+    elif action == "quiet_set":
+        lines.append(f"🌙 Тихие часы: {quiet_txt}.")
+
+    if enabled:
+        sched = _describe_schedule(cfg)
+        if action in ("set", "status"):
+            head = "🔔 Буду напоминать" if action == "set" else "🔔 <b>Напоминания о задачах включены:</b>"
+            extra = f", кроме {quiet_txt}" if (quiet_on and cfg["kind"] == "interval") else ""
+            lines.append(f"{head} {sched}{extra}.")
+        else:
+            lines.append(f"Расписание не изменилось: {sched}.")
+        nxt = cfg.get("next_run_at")
+        if nxt:
+            try:
+                lines.append("Ближайшее — " + _human_when(datetime.fromisoformat(nxt), tz_name, now_utc) + ".")
+            except ValueError:
+                pass
+        if action == "status":
+            lines.append(f"Тихие часы: {quiet_txt}" if quiet_on else "Тихие часы выключены")
+    elif action in ("quiet_set", "quiet_off"):
+        lines.append("Напоминания о задачах пока выключены — напиши расписание, например «каждые 2 часа».")
+    elif action == "status":
+        lines.append("🔔 <b>Напоминания о задачах выключены.</b>")
+
+    if tz_name == "UTC":
+        lines.append("\n🌍 Часовой пояс не настроен (UTC). Отправь /timezone, чтобы время было местным.")
+    return "\n".join(lines)
