@@ -159,6 +159,38 @@ async def set_user_status(user_id: int, status: str) -> None:
         )
 
 
+async def set_user_setting_key(user_id: int, key: str, value) -> bool:
+    """
+    Точечная запись в settings пользователя через jsonb_set.
+    Не затирает остальные ключи (timezone и др.), безопасна при гонках с фоновым циклом.
+    """
+    import json
+    value_json = json.dumps(value)
+    async with get_pool().acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE users
+            SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), %s, %s::jsonb, true)
+            WHERE user_id = %s
+            """,
+            f"{{\"{key}\"}}", value_json, user_id,
+        )
+    return int(result.split()[-1]) > 0
+
+
+async def get_users_with_task_reminders() -> list[dict]:
+    """Пользователи с включёнными напоминаниями о задачах."""
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT user_id, settings
+            FROM users
+            WHERE settings->'task_reminders'->>'enabled' = 'true'
+            """
+        )
+    return [dict(row) for row in rows]
+
+
 async def update_user_settings(user_id: int, settings: dict) -> bool:
     async with get_pool().acquire() as conn:
         result = await conn.execute(
