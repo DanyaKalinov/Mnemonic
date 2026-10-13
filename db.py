@@ -520,65 +520,58 @@ async def create_tasks_table_if_not_exists() -> None:
             )
 
 
+async def _next_user_seq(conn, user_id: int) -> int:
+    """
+    Следующий номер задачи пользователя.
+    Если у пользователя нет ни одной задачи — нумерация начинается с 1.
+    Вызывать только внутри транзакции.
+    """
+    # Гарантируем, что строка счётчика существует
+    await conn.execute(
+        "INSERT INTO task_counters (user_id, last_seq) VALUES ($1, 0) "
+        "ON CONFLICT (user_id) DO NOTHING",
+        user_id,
+    )
+    # Блокируем строку счётчика, чтобы параллельные вставки не получили один номер
+    row = await conn.fetchrow(
+        "SELECT last_seq FROM task_counters WHERE user_id = $1 FOR UPDATE",
+        user_id,
+    )
+    has_tasks = await conn.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM tasks WHERE user_id = $1)", user_id
+    )
+    # Список пуст — сбрасываем счётчик, иначе продолжаем с последнего номера
+    new_seq = (row["last_seq"] if has_tasks else 0) + 1
+    await conn.execute(
+        "UPDATE task_counters SET last_seq = $2 WHERE user_id = $1",
+        user_id, new_seq,
+    )
+    return new_seq
+
+
 async def add_single_task(user_id: int, title: str) -> int:
-    """
-    Добавляет одну задачу для пользователя.
-    Атомарно получает следующий user_seq из task_counters.
-    Возвращает user_seq (номер задачи для пользователя).
-    """
+    """Добавляет одну задачу, возвращает её user_seq."""
     async with get_pool().acquire() as conn:
         async with conn.transaction():
-            # Получаем следующий номер атомарно
-            row = await conn.fetchrow(
-                """
-                INSERT INTO task_counters (user_id, last_seq)
-                VALUES ($1, 1)
-                ON CONFLICT (user_id) DO UPDATE SET last_seq = task_counters.last_seq + 1
-                RETURNING last_seq
-                """,
-                user_id,
-            )
-            user_seq = row["last_seq"]
-
-            # Вставляем задачу с полученным номером
+            user_seq = await _next_user_seq(conn, user_id)
             await conn.execute(
-                """
-                INSERT INTO tasks (user_id, title, user_seq)
-                VALUES ($1, $2, $3)
-                """,
+                "INSERT INTO tasks (user_id, title, user_seq) VALUES ($1, $2, $3)",
                 user_id, title, user_seq,
             )
     return user_seq
 
 
 async def add_tasks_batch(user_id: int, tasks_titles: list[str], interval_minutes: int = 0) -> list[int]:
-    """
-    Массово добавляет список задач.
-    Атомарно получает следующие user_seq из task_counters для каждой задачи.
-    Возвращает список user_seq (номера задач для пользователя).
-    """
+    """Массово добавляет задачи, возвращает список их user_seq."""
     async with get_pool().acquire() as conn:
         async with conn.transaction():
             inserted_seqs = []
             for title in tasks_titles:
-                # Получаем следующий номер атомарно
-                row = await conn.fetchrow(
-                    """
-                    INSERT INTO task_counters (user_id, last_seq)
-                    VALUES ($1, 1)
-                    ON CONFLICT (user_id) DO UPDATE SET last_seq = task_counters.last_seq + 1
-                    RETURNING last_seq
-                    """,
-                    user_id,
-                )
-                user_seq = row["last_seq"]
-
-                # Вставляем задачу с полученным номером
+                # Первая задача в пустом списке получит #1, дальше по порядку
+                user_seq = await _next_user_seq(conn, user_id)
                 await conn.execute(
-                    """
-                    INSERT INTO tasks (user_id, title, interval_minutes, user_seq)
-                    VALUES ($1, $2, $3, $4)
-                    """,
+                    "INSERT INTO tasks (user_id, title, interval_minutes, user_seq) "
+                    "VALUES ($1, $2, $3, $4)",
                     user_id, title, interval_minutes, user_seq,
                 )
                 inserted_seqs.append(user_seq)
