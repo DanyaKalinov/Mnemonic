@@ -7,6 +7,7 @@ from google import genai
 from google.genai import types
 from groq import Groq
 from memory import search_memory
+from db import get_recent_chat_messages
 
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -16,6 +17,27 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+
+# Сколько последних сообщений диалога (и твоих, и Евы) передаём модели
+CHAT_HISTORY_LIMIT = 15
+# Длинные сообщения обрезаем, чтобы не раздувать запрос (важно на бесплатном Gemini)
+CHAT_MESSAGE_MAX_CHARS = 1500
+
+
+def _history_to_contents(history: list[dict]) -> list[types.Content]:
+    """Переводит записи из БД в формат Gemini: роль assistant → model."""
+    contents: list[types.Content] = []
+    for msg in history:
+        # Диалог для Gemini должен начинаться с реплики пользователя,
+        # поэтому пропускаем ведущие ответы Евы, если они попали в начало окна
+        if not contents and msg["role"] == "assistant":
+            continue
+        role = "model" if msg["role"] == "assistant" else "user"
+        contents.append(
+            types.Content(role=role, parts=[types.Part(text=msg["text"][:CHAT_MESSAGE_MAX_CHARS])])
+        )
+    return contents
+
 
 async def get_ai_response(user_id: int, user_question: str) -> str:
     if not GOOGLE_API_KEY:
@@ -38,20 +60,26 @@ async def get_ai_response(user_id: int, user_question: str) -> str:
             "но ты можешь дать полезный общий совет."
         )
 
+    # История диалога. Если база недоступна, отвечаем без неё, а не падаем
     try:
-        # generate_content — синхронный блокирующий сетевой вызов, уводим
-        # его в отдельный поток, чтобы не подвешивать event loop бота
-        # на время ожидания ответа от Gemini (иначе зависли бы все
-        # остальные пользователи и обработка входящих вебхуков).
+        history = await get_recent_chat_messages(user_id, limit=CHAT_HISTORY_LIMIT)
+    except Exception as e:
+        print(f"❌ Ошибка чтения истории диалога: {e}")
+        history = []
+
+    # Предыдущие реплики + текущий вопрос отдельной репликой пользователя
+    contents = _history_to_contents(history)
+    contents.append(types.Content(role="user", parts=[types.Part(text=user_question)]))
+
+    try:
+        # generate_content — синхронный блокирующий вызов, уводим его в отдельный поток,
+        # чтобы не подвешивать event loop бота на время ответа Gemini
         response = await asyncio.to_thread(
             client.models.generate_content,
             model="gemini-flash-lite-latest",
-            contents=[
-                types.Content(
-                    role="user",
-                    parts=[types.Part(text=f"{system_prompt}\n\nВопрос пользователя: {user_question}")]
-                )
-            ]
+            contents=contents,
+            # Роль Евы и факты о пользователе — в системной инструкции, отдельно от диалога
+            config=types.GenerateContentConfig(system_instruction=system_prompt),
         )
         return response.text
     except Exception as e:
