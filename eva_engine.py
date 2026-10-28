@@ -20,8 +20,8 @@ from typing import Awaitable, Callable, Optional
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from ai_core import interpret_eva_command, ask_web
-from db import add_eva_command
+from ai_core import interpret_eva_command, ask_web, CHAT_HISTORY_LIMIT, CHAT_MESSAGE_MAX_CHARS
+from db import add_eva_command, add_chat_message, get_recent_chat_messages
 from eva_agent_registry import push_command_to_agents, get_user_agent, send_to_user_agent, speak_to_owner
 from eva_command_parser import parse_eva_command, split_into_subcommands
 import chat_state
@@ -43,21 +43,46 @@ def is_agent_online(user_id: int) -> bool:
     return get_user_agent(user_id) is not None
 
 
+async def _load_history_for_agent(user_id: int) -> list[dict]:
+    """История диалога для локального мозга: последние реплики из базы сервера."""
+    try:
+        rows = await get_recent_chat_messages(user_id, limit=CHAT_HISTORY_LIMIT)
+    except Exception as e:
+        print(f"⚠️ Не удалось загрузить историю для агента: {e}", flush=True)
+        return []
+    return [{"role": r["role"], "text": r["text"][:CHAT_MESSAGE_MAX_CHARS]} for r in rows]
+
+
+async def _save_chat_message(user_id: int, role: str, text: str) -> None:
+    """Сохраняет реплику в историю. Сбой записи не должен ломать ответ пользователю."""
+    if not text or not text.strip():
+        return
+    try:
+        await add_chat_message(user_id, role, text)
+    except Exception as e:
+        print(f"⚠️ Не удалось сохранить реплику в историю: {e}", flush=True)
+
+
 async def relay_to_agent(bot: Bot, user_id: int, text: str, reply: ReplyFunc, source: str) -> None:
-    """Онлайн-путь: сырой текст + инъекция памяти уходит агенту как 'chat'.
+    """Онлайн-путь: сырой текст + память + история диалога уходят агенту как 'chat'.
     Мозг (локальная модель) отвечает сам; это не разбор на сервере."""
     origin = _ORIGIN_VOICE if source == "voice" else _ORIGIN_TELEGRAM
     message_id = new_message_id()
     register_message(message_id, user_id, origin, text)
 
     memories = await search_memory(user_id, text, k=TOP_MEMORY_K)
+    # История берётся ДО сохранения текущей реплики, иначе вопрос попадёт в неё дважды
+    history = await _load_history_for_agent(user_id)
     payload = {
         "type": "chat",
         "message_id": message_id,
         "text": text,
         "origin": origin,
         "memory": memories,
+        "history": history,
     }
+    # Вопрос сохраняем до отправки, чтобы порядок реплик в истории был верным
+    await _save_chat_message(user_id, "user", text)
     sent = await send_to_user_agent(user_id, payload)
     if not sent:
         await reply("📥 Агент сейчас не на связи — попробуй позже.")
@@ -258,6 +283,9 @@ async def handle_chat_result(bot: Bot, data: dict) -> None:
         return
     kind = data.get("kind", "answer")
     text = str(data.get("text") or "")
+    # Ответ Евы сохраняем в историю (ошибки — нет, это шум для модели)
+    if kind != "error":
+        await _save_chat_message(meta["user_id"], "assistant", text)
     if kind == "error":
         text = f"⚠️ {text}"
     await _deliver_text(bot, meta["user_id"], text, data.get("image_base64"))
