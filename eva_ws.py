@@ -112,6 +112,9 @@ async def _handle_agent_message(raw: str, bot: Bot, agent_id: str, ws: web.WebSo
             message_id = new_message_id()
             eva_engine.chat_state.register_message(message_id, owner_id, "app", text)
             memories = await search_memory(owner_id, text, k=5)
+            # История диалога — как в relay_to_agent: грузим ДО сохранения текущей реплики
+            history = await eva_engine._load_history_for_agent(owner_id)
+            await eva_engine._save_chat_message(owner_id, "user", text)
             await ws.send_str(
                 json.dumps(
                     {
@@ -120,6 +123,7 @@ async def _handle_agent_message(raw: str, bot: Bot, agent_id: str, ws: web.WebSo
                         "text": text,
                         "origin": "app",
                         "memory": memories,
+                        "history": history,
                     }
                 )
             )
