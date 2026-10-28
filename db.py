@@ -35,6 +35,8 @@ async def init_db() -> None:
     
     # Автоматически создаем таблицу задач при запуске
     await create_tasks_table_if_not_exists()
+    # Таблица истории диалога (нужна для контекста Gemini и локального мозга)
+    await create_chat_history_table_if_not_exists()
 
 
 async def close_db() -> None:
@@ -586,20 +588,14 @@ async def add_tasks_batch(user_id: int, tasks_titles: list[str], interval_minute
 
 
 async def get_user_tasks(user_id: int) -> list[dict]:
-    """
-    Возвращает все задачи пользователя с их user_seq.
-    Порядок: сначала «В работе» (pending), затем «Готово» (completed),
-    внутри каждой группы — по номеру user_seq (1, 2, 3…).
-    """
+    """Возвращает все задачи пользователя с их user_seq."""
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT id, user_id, title, status, interval_minutes, created_at, user_seq
             FROM tasks
             WHERE user_id = $1
-            ORDER BY
-                CASE WHEN status = 'completed' THEN 1 ELSE 0 END,  -- «В работе» выше «Готово»
-                user_seq                                             -- внутри группы — по номеру
+            ORDER BY created_at DESC
             """,
             user_id,
         )
@@ -661,5 +657,56 @@ async def get_pending_task_reminders() -> list[dict]:
             WHERE status = 'pending'
             ORDER BY created_at
             """
+        )
+    return [dict(row) for row in rows]
+
+
+# ----- История диалога (контекст для Gemini и локального мозга) -----
+async def create_chat_history_table_if_not_exists() -> None:
+    """Создаёт таблицу chat_messages и индекс по (user_id, created_at). Идемпотентна."""
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+                text TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS chat_messages_user_created_idx
+            ON chat_messages (user_id, created_at DESC)
+            """
+        )
+
+
+async def add_chat_message(user_id: int, role: str, text: str) -> None:
+    """Сохраняет одно сообщение диалога: role — 'user' или 'assistant'."""
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            "INSERT INTO chat_messages (user_id, role, text) VALUES ($1, $2, $3)",
+            user_id, role, text,
+        )
+
+
+async def get_recent_chat_messages(user_id: int, limit: int = 15) -> list[dict]:
+    """Последние N сообщений диалога, от старых к новым (в таком порядке их ждёт модель)."""
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT role, text FROM (
+                SELECT role, text, created_at, id
+                FROM chat_messages
+                WHERE user_id = $1
+                ORDER BY created_at DESC, id DESC
+                LIMIT $2
+            ) AS last_msgs
+            ORDER BY created_at, id
+            """,
+            user_id, limit,
         )
     return [dict(row) for row in rows]
