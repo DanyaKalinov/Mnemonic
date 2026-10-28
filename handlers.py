@@ -28,7 +28,7 @@ from db import (
     set_user_role, is_owner, get_eva_command, update_eva_command_status,
     can_use_eva, set_eva_access, list_owner_ids, list_eva_access_users,
     get_user_tasks, toggle_task_status, add_single_task, add_tasks_batch, clear_completed_tasks,
-    set_user_setting_key,
+    set_user_setting_key, add_chat_message,
 )
 from reminder_parser import parse_reminder_text
 from task_reminder_parser import (
@@ -1124,6 +1124,10 @@ async def handle_text(message: Message, state: FSMContext):
     await message.answer("🧠 Думаю...")
     answer = await get_ai_response(user_id, user_text)
     await message.answer(answer)
+
+    # Сохраняем обмен репликами, чтобы следующий ответ учитывал контекст
+    await add_chat_message(user_id, "user", user_text)
+    await add_chat_message(user_id, "assistant", answer)
 
 
 # ----- Обработка напоминаний -----
