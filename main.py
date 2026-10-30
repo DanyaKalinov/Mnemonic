@@ -24,15 +24,8 @@ from ai_core import summarize_for_digest
 from access_control import ApprovalMiddleware
 from error_handler import register_error_handler
 from eva_ws import eva_ws_handler
-try:
-    # ВАЖНО: эта функция вызывается в check_reminders. Если её не импортировать,
-    # каждое обычное напоминание будет падать с NameError и приходить повторно каждые 30 секунд.
-    from eva_ws import notify_agent_reminder
-except ImportError:
-    logging.warning("notify_agent_reminder не найден в eva_ws.py — проверь, где он объявлен")
-
-    async def notify_agent_reminder(user_id, text):  # заглушка, чтобы бот не падал
-        return False
+# notify_agent_reminder объявлена в eva_agent_registry (раньше ошибочно импортировалась из eva_ws).
+from eva_agent_registry import notify_agent_reminder
 from task_reminder_parser import next_run_from_config
 from bot_commands import set_default_commands, sync_commands_for_user
 
