@@ -28,6 +28,8 @@ from eva_ws import eva_ws_handler
 from eva_agent_registry import notify_agent_reminder
 from task_reminder_parser import next_run_from_config
 from bot_commands import set_default_commands, sync_commands_for_user
+# FSM-состояния хранятся в PostgreSQL и переживают деплой (вместо MemoryStorage)
+from fsm_storage import PostgresStorage
 
 logging.basicConfig(level=logging.INFO)
 
@@ -275,7 +277,8 @@ async def health(request: web.Request) -> web.Response:
 def main():
     bot = Bot(token=BOT_TOKEN)
 
-    dp = Dispatcher()
+    # Состояния FSM хранятся в Supabase: диалоги не сбрасываются при деплое
+    dp = Dispatcher(storage=PostgresStorage())
     dp.message.middleware(ApprovalMiddleware())
     dp.include_router(router)
     register_error_handler(dp)
