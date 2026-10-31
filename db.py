@@ -37,6 +37,8 @@ async def init_db() -> None:
     await create_tasks_table_if_not_exists()
     # Таблица истории диалога (нужна для контекста Gemini и локального мозга)
     await create_chat_history_table_if_not_exists()
+    # Таблица состояний FSM: создание задач и т.д. переживают деплой
+    await create_fsm_table_if_not_exists()
 
 
 async def close_db() -> None:
@@ -719,3 +721,82 @@ async def get_recent_chat_messages(user_id: int, limit: int = 15) -> list[dict]:
             user_id, limit,
         )
     return [dict(row) for row in rows]
+
+
+# ----- Состояния FSM (aiogram) -----
+FSM_STALE_DAYS = 7  # записи старше этого срока удаляются при старте бота
+
+
+async def create_fsm_table_if_not_exists() -> None:
+    """Создаёт таблицу fsm_states и удаляет давно брошенные диалоги. Идемпотентна."""
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fsm_states (
+                state_key TEXT PRIMARY KEY,
+                state TEXT,
+                data JSONB NOT NULL DEFAULT '{}'::jsonb,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        # Пользователь начал диалог и ушёл — такие записи со временем не нужны
+        await conn.execute(
+            "DELETE FROM fsm_states WHERE updated_at < now() - make_interval(days => $1)",
+            FSM_STALE_DAYS,
+        )
+
+
+async def _fsm_delete_if_empty(conn, state_key: str) -> None:
+    """Если состояния и данных нет, удаляем строку, чтобы таблица не пухла."""
+    await conn.execute(
+        "DELETE FROM fsm_states WHERE state_key = $1 AND state IS NULL AND data = '{}'::jsonb",
+        state_key,
+    )
+
+
+async def fsm_get_state(state_key: str) -> Optional[str]:
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT state FROM fsm_states WHERE state_key = $1", state_key
+        )
+    return row["state"] if row else None
+
+
+async def fsm_get_data(state_key: str) -> dict:
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT data FROM fsm_states WHERE state_key = $1", state_key
+        )
+    if not row:
+        return {}
+    # asyncpg без кодека отдаёт jsonb строкой, поэтому разбираем сами
+    return _deserialize_settings(row["data"])
+
+
+async def fsm_set_state(state_key: str, state: Optional[str]) -> None:
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO fsm_states (state_key, state, data, updated_at)
+            VALUES ($1, $2, '{}'::jsonb, now())
+            ON CONFLICT (state_key) DO UPDATE
+            SET state = EXCLUDED.state, updated_at = now()
+            """,
+            state_key, state,
+        )
+        await _fsm_delete_if_empty(conn, state_key)
+
+
+async def fsm_set_data(state_key: str, data: dict) -> None:
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO fsm_states (state_key, state, data, updated_at)
+            VALUES ($1, NULL, $2::jsonb, now())
+            ON CONFLICT (state_key) DO UPDATE
+            SET data = EXCLUDED.data, updated_at = now()
+            """,
+            state_key, json.dumps(data or {}, ensure_ascii=False),
+        )
+        await _fsm_delete_if_empty(conn, state_key)
