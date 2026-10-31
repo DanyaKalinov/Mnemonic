@@ -522,25 +522,44 @@ async def create_tasks_table_if_not_exists() -> None:
             )
 
 
+async def _next_user_seq(conn, user_id: int) -> int:
+    """
+    Следующий номер задачи пользователя = MAX(user_seq) + 1 по существующим задачам
+    (при пустом списке — 1). Строка счётчика блокируется FOR UPDATE, чтобы два
+    параллельных добавления не получили один и тот же номер.
+    Вызывать только внутри транзакции.
+    """
+    # Гарантируем, что строка счётчика существует, и блокируем её
+    await conn.execute(
+        """
+        INSERT INTO task_counters (user_id, last_seq)
+        VALUES ($1, 0)
+        ON CONFLICT (user_id) DO NOTHING
+        """,
+        user_id,
+    )
+    await conn.fetchval(
+        "SELECT last_seq FROM task_counters WHERE user_id = $1 FOR UPDATE", user_id
+    )
+    # Считаем от реально существующих задач, а не от «залипшего» счётчика
+    next_seq = await conn.fetchval(
+        "SELECT COALESCE(MAX(user_seq), 0) + 1 FROM tasks WHERE user_id = $1", user_id
+    )
+    await conn.execute(
+        "UPDATE task_counters SET last_seq = $2 WHERE user_id = $1", user_id, next_seq
+    )
+    return next_seq
+
+
 async def add_single_task(user_id: int, title: str) -> int:
     """
     Добавляет одну задачу для пользователя.
-    Атомарно получает следующий user_seq из task_counters.
+    Номер = MAX(user_seq) + 1 (см. _next_user_seq), при пустом списке — 1.
     Возвращает user_seq (номер задачи для пользователя).
     """
     async with get_pool().acquire() as conn:
         async with conn.transaction():
-            # Получаем следующий номер атомарно
-            row = await conn.fetchrow(
-                """
-                INSERT INTO task_counters (user_id, last_seq)
-                VALUES ($1, 1)
-                ON CONFLICT (user_id) DO UPDATE SET last_seq = task_counters.last_seq + 1
-                RETURNING last_seq
-                """,
-                user_id,
-            )
-            user_seq = row["last_seq"]
+            user_seq = await _next_user_seq(conn, user_id)
 
             # Вставляем задачу с полученным номером
             await conn.execute(
@@ -555,25 +574,15 @@ async def add_single_task(user_id: int, title: str) -> int:
 
 async def add_tasks_batch(user_id: int, tasks_titles: list[str], interval_minutes: int = 0) -> list[int]:
     """
-    Массово добавляет список задач.
-    Атомарно получает следующие user_seq из task_counters для каждой задачи.
+    Массово добавляет список задач в одной транзакции.
+    Номера идут подряд от MAX(user_seq) + 1 (см. _next_user_seq).
     Возвращает список user_seq (номера задач для пользователя).
     """
     async with get_pool().acquire() as conn:
         async with conn.transaction():
             inserted_seqs = []
             for title in tasks_titles:
-                # Получаем следующий номер атомарно
-                row = await conn.fetchrow(
-                    """
-                    INSERT INTO task_counters (user_id, last_seq)
-                    VALUES ($1, 1)
-                    ON CONFLICT (user_id) DO UPDATE SET last_seq = task_counters.last_seq + 1
-                    RETURNING last_seq
-                    """,
-                    user_id,
-                )
-                user_seq = row["last_seq"]
+                user_seq = await _next_user_seq(conn, user_id)
 
                 # Вставляем задачу с полученным номером
                 await conn.execute(
