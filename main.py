@@ -19,6 +19,7 @@ from db import (
     list_approved_users, get_recent_memories, set_last_digest_at,
     get_user, get_users_with_task_reminders, get_user_tasks,
     claim_task_reminder_run, disable_task_reminders,
+    cleanup_eva_commands, cleanup_chat_messages,
 )
 from ai_core import summarize_for_digest
 from access_control import ApprovalMiddleware
@@ -162,6 +163,26 @@ async def task_reminders_loop(bot: Bot):
         await asyncio.sleep(TASK_REMINDER_TICK_SECONDS)
 
 
+# === ФОНОВАЯ ЗАДАЧА: ОЧИСТКА УСТАРЕВШИХ ДАННЫХ ===
+# При старте и затем раз в 6 часов чистит eva_commands и chat_messages,
+# чтобы база не разрасталась (сроки и лимиты — константы в db.py).
+CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
+
+
+async def cleanup_loop():
+    while True:
+        try:
+            commands_deleted = await cleanup_eva_commands()
+            messages_deleted = await cleanup_chat_messages()
+            logging.info(
+                "Очистка БД: eva_commands -%s, chat_messages -%s",
+                commands_deleted, messages_deleted,
+            )
+        except Exception as e:  # цикл не должен умирать из-за одной ошибки
+            logging.exception("Ошибка цикла очистки БД: %s", e)
+        await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
+
+
 # === ФОНОВАЯ ЗАДАЧА ДЛЯ ЕЖЕДНЕВНОГО ДАЙДЖЕСТА ===
 # Проверяет раз в 10 минут: для каждого одобренного пользователя — сейчас
 # ли у него 9:00 УТРА ПО ЕГО СОБСТВЕННОМУ часовому поясу (не по времени
@@ -289,6 +310,7 @@ def main():
         asyncio.create_task(check_reminders(bot))
         asyncio.create_task(send_daily_digest(bot))
         asyncio.create_task(task_reminders_loop(bot))
+        asyncio.create_task(cleanup_loop())
 
     dp.startup.register(start_reminders)
 
