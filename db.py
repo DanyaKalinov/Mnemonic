@@ -800,3 +800,54 @@ async def fsm_set_data(state_key: str, data: dict) -> None:
             state_key, json.dumps(data or {}, ensure_ascii=False),
         )
         await _fsm_delete_if_empty(conn, state_key)
+
+
+# ----- Очистка устаревших данных -----
+EVA_COMMANDS_KEEP_DAYS = 30        # завершённые команды (done/error/cancelled) храним столько дней
+EVA_COMMANDS_STALE_DAYS = 7        # зависшие pending / awaiting_confirmation старше этого срока не нужны
+CHAT_MESSAGES_KEEP_PER_USER = 200  # сколько последних реплик диалога хранить на пользователя
+
+
+async def cleanup_eva_commands() -> int:
+    """Удаляет старые команды Евы. Возвращает, сколько строк удалено."""
+    async with get_pool().acquire() as conn:
+        # Завершённые команды: результат давно доставлен в Telegram, хранить незачем
+        finished = await conn.execute(
+            """
+            DELETE FROM eva_commands
+            WHERE status NOT IN ('pending', 'awaiting_confirmation')
+              AND COALESCE(updated_at, created_at) < now() - make_interval(days => $1)
+            """,
+            EVA_COMMANDS_KEEP_DAYS,
+        )
+        # Зависшие команды: выполнять их спустя неделю уже небезопасно
+        stale = await conn.execute(
+            """
+            DELETE FROM eva_commands
+            WHERE status IN ('pending', 'awaiting_confirmation')
+              AND COALESCE(updated_at, created_at) < now() - make_interval(days => $1)
+            """,
+            EVA_COMMANDS_STALE_DAYS,
+        )
+    return int(finished.split()[-1]) + int(stale.split()[-1])
+
+
+async def cleanup_chat_messages() -> int:
+    """Оставляет только последние CHAT_MESSAGES_KEEP_PER_USER реплик на пользователя."""
+    async with get_pool().acquire() as conn:
+        result = await conn.execute(
+            """
+            DELETE FROM chat_messages
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY user_id ORDER BY created_at DESC, id DESC
+                    ) AS rn
+                    FROM chat_messages
+                ) AS ranked
+                WHERE rn > $1
+            )
+            """,
+            CHAT_MESSAGES_KEEP_PER_USER,
+        )
+    return int(result.split()[-1])
