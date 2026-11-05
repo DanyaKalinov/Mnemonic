@@ -736,6 +736,33 @@ async def get_recent_chat_messages(user_id: int, limit: int = 15) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+async def get_chat_messages_with_ids(user_id: int, limit: int = 100) -> list[dict]:
+    """Последние N реплик с id и временем (от старых к новым) — для окна приложения."""
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, role, text, created_at FROM (
+                SELECT id, role, text, created_at
+                FROM chat_messages
+                WHERE user_id = $1
+                ORDER BY created_at DESC, id DESC
+                LIMIT $2
+            ) AS last_msgs
+            ORDER BY created_at, id
+            """,
+            user_id, limit,
+        )
+    return [
+        {
+            "id": r["id"],
+            "role": r["role"],
+            "text": r["text"],
+            "created_at": r["created_at"].isoformat(),
+        }
+        for r in rows
+    ]
+
+
 async def delete_chat_messages(user_id: int, ids: list[int]) -> list[int]:
     """Удаляет реплики по id, только принадлежащие этому пользователю.
     Возвращает id сообщений Telegram (где они известны), чтобы удалить их и из чата."""
