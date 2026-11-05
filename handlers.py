@@ -38,7 +38,7 @@ from task_reminder_parser import (
 )
 from memory import add_memory
 from ai_core import get_ai_response, describe_image, transcribe_voice, summarize_for_digest
-from eva_agent_registry import is_agent_connected, push_command_to_agents
+from eva_agent_registry import is_agent_connected, push_command_to_agents, send_to_user_agent
 from eva_engine import process_eva_command, build_forget_keyboard
 from bot_commands import sync_commands_for_user
 
@@ -794,6 +794,8 @@ async def handle_forget(callback: CallbackQuery):
             await callback.message.edit_text("🗑 Забыла это сообщение.")
         except Exception:
             pass
+    # Если открыто окно приложения — пусть тоже уберёт эти реплики
+    await send_to_user_agent(callback.from_user.id, {"type": "chat_deleted", "ids": ids})
     await callback.answer("🗑 Забыла")
 
 
@@ -828,6 +830,9 @@ async def handle_clear_confirm(callback: CallbackQuery):
             await callback.bot.delete_messages(chat_id, to_delete[start:start + 100])
         except Exception as e:
             print(f"⚠️ Не удалось удалить сообщения из чата Telegram: {e}")
+
+    # Окно приложения (если открыто) тоже очищает историю
+    await send_to_user_agent(callback.from_user.id, {"type": "chat_cleared"})
 
     await callback.message.edit_text(f"🧹 История стёрта (реплик в базе: {deleted}).")
     await callback.answer()
