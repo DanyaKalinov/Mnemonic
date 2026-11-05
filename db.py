@@ -693,15 +693,28 @@ async def create_chat_history_table_if_not_exists() -> None:
             ON chat_messages (user_id, created_at DESC)
             """
         )
-
-
-async def add_chat_message(user_id: int, role: str, text: str) -> None:
-    """Сохраняет одно сообщение диалога: role — 'user' или 'assistant'."""
-    async with get_pool().acquire() as conn:
+        # id сообщения в Telegram: нужен, чтобы при «Забыть» / «/clear» убрать
+        # сообщение и из чата Telegram, а не только из базы
         await conn.execute(
-            "INSERT INTO chat_messages (user_id, role, text) VALUES ($1, $2, $3)",
-            user_id, role, text,
+            "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS tg_message_id BIGINT"
         )
+
+
+async def add_chat_message(
+    user_id: int, role: str, text: str, tg_message_id: Optional[int] = None
+) -> int:
+    """Сохраняет одно сообщение диалога: role — 'user' или 'assistant'.
+    Возвращает id строки (нужен для кнопки «Забыть»)."""
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO chat_messages (user_id, role, text, tg_message_id)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id
+            """,
+            user_id, role, text, tg_message_id,
+        )
+    return row["id"]
 
 
 async def get_recent_chat_messages(user_id: int, limit: int = 15) -> list[dict]:
@@ -721,6 +734,35 @@ async def get_recent_chat_messages(user_id: int, limit: int = 15) -> list[dict]:
             user_id, limit,
         )
     return [dict(row) for row in rows]
+
+
+async def delete_chat_messages(user_id: int, ids: list[int]) -> list[int]:
+    """Удаляет реплики по id, только принадлежащие этому пользователю.
+    Возвращает id сообщений Telegram (где они известны), чтобы удалить их и из чата."""
+    if not ids:
+        return []
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            DELETE FROM chat_messages
+            WHERE user_id = $1 AND id = ANY($2::bigint[])
+            RETURNING tg_message_id
+            """,
+            user_id, ids,
+        )
+    return [r["tg_message_id"] for r in rows if r["tg_message_id"] is not None]
+
+
+async def clear_chat_history(user_id: int) -> tuple[int, list[int]]:
+    """Стирает всю историю диалога пользователя.
+    Возвращает (сколько реплик удалено, id сообщений Telegram для удаления из чата)."""
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            "DELETE FROM chat_messages WHERE user_id = $1 RETURNING tg_message_id",
+            user_id,
+        )
+    tg_ids = [r["tg_message_id"] for r in rows if r["tg_message_id"] is not None]
+    return len(rows), tg_ids
 
 
 # ----- Состояния FSM (aiogram) -----
