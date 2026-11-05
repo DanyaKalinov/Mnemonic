@@ -7,7 +7,8 @@ WebSocket-мост между сервером (Ева) и desktop-агенто�
    владельца, которому принадлежит этот ПК — проверяется по базе: должен
    быть либо role='owner', либо иметь eva_access='granted').
 2. Сразу после подключения сервер отправляет ему все команды, которые
-   накопились в очереди, пока агента не было на связи (status='pending').
+   накопились в очереди, пока агента не было на связи (status='pending'),
+   а также историю диалога для окна приложения ({"type": "chat_history"}).
 3. Когда владелец пишет команду боту в Telegram (или произносит голосом —
    см. eva_engine.py) — она сохраняется в БД и, если агент на связи,
    сразу же уходит ему.
@@ -20,6 +21,9 @@ WebSocket-мост между сервером (Ева) и desktop-агенто�
    конвейер (eva_engine.process_eva_command), что и текстовые команды —
    включая обязательное подтверждение в Telegram для разрушительных
    действий, даже если распознанный голос попросил об этом напрямую.
+6. Окно приложения может удалить реплику диалога: {"type": "delete_message", "id": ...}.
+   Сервер удаляет запись из chat_messages (только у этого владельца), убирает
+   её копию из чата Telegram и отвечает {"type": "chat_deleted", "ids": [...]}.
 """
 import base64
 import json
@@ -31,11 +35,18 @@ from aiohttp import web, WSMsgType
 
 from config import EVA_AGENT_SECRET
 import chat_state
-from db import get_pending_eva_commands, update_eva_command_status, get_eva_command, can_use_eva
+from db import (
+    get_pending_eva_commands, update_eva_command_status, get_eva_command, can_use_eva,
+    get_chat_messages_with_ids, delete_chat_messages,
+)
 from eva_agent_registry import (
     register_agent, unregister_agent, push_command_to_agents, get_owner_id_for_agent,
+    send_to_user_agent,
 )
 from memory import search_memory
+
+# Сколько последних реплик диалога показывать в окне приложения при подключении
+CHAT_HISTORY_WINDOW_LIMIT = 100
 
 
 async def eva_ws_handler(request: web.Request) -> web.WebSocketResponse:
@@ -68,6 +79,9 @@ async def eva_ws_handler(request: web.Request) -> web.WebSocketResponse:
         if cmd.get("action_json"):
             await push_command_to_agents(cmd["id"], cmd["action_json"])
 
+    # История диалога для окна приложения
+    await _send_chat_history(ws, owner_id)
+
     try:
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
@@ -79,6 +93,41 @@ async def eva_ws_handler(request: web.Request) -> web.WebSocketResponse:
         print(f"🔌 Агент Евы отключился: {agent_id}", flush=True)
 
     return ws
+
+
+async def _send_chat_history(ws: web.WebSocketResponse, owner_id: int) -> None:
+    """Отправляет окну приложения последние реплики диалога (с id — по ним работает удаление).
+    Сбой базы не должен рвать подключение агента."""
+    try:
+        messages = await get_chat_messages_with_ids(owner_id, limit=CHAT_HISTORY_WINDOW_LIMIT)
+        await ws.send_str(json.dumps({"type": "chat_history", "messages": messages}))
+    except Exception as e:
+        print(f"⚠️ Не удалось отправить историю диалога агенту: {e}", flush=True)
+
+
+async def _handle_delete_message_request(data: dict, bot: Bot, agent_id: str) -> None:
+    """Окно приложения просит удалить реплику диалога по id."""
+    owner_id = get_owner_id_for_agent(agent_id)
+    msg_id = data.get("id")
+    if owner_id is None or not isinstance(msg_id, int) or isinstance(msg_id, bool):
+        return
+
+    try:
+        # Удаляем только реплику этого владельца (проверка user_id внутри функции)
+        tg_ids = await delete_chat_messages(owner_id, [msg_id])
+    except Exception as e:
+        print(f"⚠️ Не удалось удалить реплику {msg_id}: {e}", flush=True)
+        return
+
+    # Копию сообщения в чате Telegram тоже убираем (если оно было и не старше 48 часов)
+    for tg_id in tg_ids:
+        try:
+            await bot.delete_message(owner_id, tg_id)
+        except Exception:
+            pass
+
+    # Подтверждаем окну(ам): пусть уберут реплику у себя
+    await send_to_user_agent(owner_id, {"type": "chat_deleted", "ids": [msg_id]})
 
 
 async def _handle_agent_message(raw: str, bot: Bot, agent_id: str, ws: web.WebSocketResponse) -> None:
@@ -103,6 +152,8 @@ async def _handle_agent_message(raw: str, bot: Bot, agent_id: str, ws: web.WebSo
     elif msg_type == "cloud_action":
         from eva_engine import handle_cloud_action
         await handle_cloud_action(ws, agent_id, data)
+    elif msg_type == "delete_message":
+        await _handle_delete_message_request(data, bot, agent_id)
     elif msg_type == "chat":
         text = data.get("text", "")
         from chat_state import new_message_id
@@ -114,7 +165,11 @@ async def _handle_agent_message(raw: str, bot: Bot, agent_id: str, ws: web.WebSo
             memories = await search_memory(owner_id, text, k=5)
             # История диалога — как в relay_to_agent: грузим ДО сохранения текущей реплики
             history = await eva_engine._load_history_for_agent(owner_id)
-            await eva_engine._save_chat_message(owner_id, "user", text)
+            user_row_id = await eva_engine._save_chat_message(owner_id, "user", text)
+            # Запоминаем id реплики: когда придёт ответ, «Забыть» в Telegram удалит обе
+            meta = chat_state.get_message(message_id)
+            if meta is not None:
+                meta["user_row_id"] = user_row_id
             await ws.send_str(
                 json.dumps(
                     {
