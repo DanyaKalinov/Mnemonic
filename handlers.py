@@ -29,6 +29,7 @@ from db import (
     can_use_eva, set_eva_access, list_owner_ids, list_eva_access_users,
     get_user_tasks, toggle_task_status, add_single_task, add_tasks_batch, clear_completed_tasks,
     set_user_setting_key, add_chat_message,
+    delete_chat_messages, clear_chat_history,
 )
 from reminder_parser import parse_reminder_text
 from task_reminder_parser import (
@@ -38,7 +39,7 @@ from task_reminder_parser import (
 from memory import add_memory
 from ai_core import get_ai_response, describe_image, transcribe_voice, summarize_for_digest
 from eva_agent_registry import is_agent_connected, push_command_to_agents
-from eva_engine import process_eva_command
+from eva_engine import process_eva_command, build_forget_keyboard
 from bot_commands import sync_commands_for_user
 
 load_dotenv()
@@ -593,7 +594,8 @@ async def cmd_help(message: Message):
         "📋 /reminders — Список активных напоминаний\n"
         "🌍 /timezone — Настроить часовой пояс по геолокации\n"
         "🗂 /memory — Последние записи в памяти\n"
-        "📰 /digest — Дайджест памяти за сутки\n\n"
+        "📰 /digest — Дайджест памяти за сутки\n"
+        "🧹 /clear — Стереть историю диалога\n\n"
         "🧠 **Просто напиши текст** — я запомню его\n"
         "🔎 **Задай вопрос** — я найду ответ среди твоих записей\n"
         "📄 **Отправь PDF** — я прочитаю и запомню его содержание\n"
@@ -755,6 +757,80 @@ async def cmd_digest(message: Message):
         await message.answer("😵 Не смог составить дайджест — попробуй ещё раз чуть позже.")
         return
     await message.answer(f"📰 Дайджест за сутки:\n\n{summary}")
+
+
+# ----- Удаление истории диалога: кнопка «🗑 Забыть» и команда /clear -----
+@router.callback_query(F.data.startswith("forget:"))
+async def handle_forget(callback: CallbackQuery):
+    """Кнопка «🗑 Забыть» под ответом Евы: удаляет реплику пользователя и ответ Евы
+    из базы (chat_messages) и из чата Telegram.
+    Формат callback_data: forget:<id реплики пользователя или 0>:<id ответа Евы>."""
+    try:
+        _, user_row, assistant_row = callback.data.split(":")
+        ids = [int(x) for x in (user_row, assistant_row) if int(x) > 0]
+    except ValueError:
+        await callback.answer("Кнопка устарела.", show_alert=True)
+        return
+
+    chat_id = callback.message.chat.id
+    # Удаляем из базы только свои реплики (проверка по user_id внутри функции)
+    tg_ids = await delete_chat_messages(callback.from_user.id, ids)
+
+    # Сообщение пользователя убираем из чата (Telegram разрешает до 48 часов после отправки)
+    for tg_id in tg_ids:
+        if tg_id == callback.message.message_id:
+            continue
+        try:
+            await callback.bot.delete_message(chat_id, tg_id)
+        except Exception:
+            pass  # старше 48 часов или уже удалено
+
+    # Само сообщение Евы (с кнопкой) — тоже удаляем
+    try:
+        await callback.message.delete()
+    except Exception:
+        # Удалить не вышло — хотя бы заменяем текст, чтобы содержимое не висело в чате
+        try:
+            await callback.message.edit_text("🗑 Забыла это сообщение.")
+        except Exception:
+            pass
+    await callback.answer("🗑 Забыла")
+
+
+@router.message(Command("clear"))
+async def cmd_clear(message: Message):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🧹 Да, стереть", callback_data="clear_confirm"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="clear_cancel"),
+    ]])
+    await message.answer(
+        "Стереть всю историю нашего диалога?\n"
+        "Записи памяти (/memory), задачи и напоминания это не затронет.",
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data == "clear_cancel")
+async def handle_clear_cancel(callback: CallbackQuery):
+    await callback.message.edit_text("Ок, историю не трогаю.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "clear_confirm")
+async def handle_clear_confirm(callback: CallbackQuery):
+    deleted, tg_ids = await clear_chat_history(callback.from_user.id)
+    chat_id = callback.message.chat.id
+
+    # Telegram удаляет до 100 сообщений за один запрос; недоступные пропускает
+    to_delete = [i for i in tg_ids if i != callback.message.message_id]
+    for start in range(0, len(to_delete), 100):
+        try:
+            await callback.bot.delete_messages(chat_id, to_delete[start:start + 100])
+        except Exception as e:
+            print(f"⚠️ Не удалось удалить сообщения из чата Telegram: {e}")
+
+    await callback.message.edit_text(f"🧹 История стёрта (реплик в базе: {deleted}).")
+    await callback.answer()
 
 
 @router.message(Command("users"))
@@ -1116,18 +1192,35 @@ async def handle_text(message: Message, state: FSMContext):
 
     from eva_engine import is_agent_online, relay_to_agent
     if is_agent_online(user_id):
-        await relay_to_agent(message.bot, user_id, user_text, message.answer, "telegram")
+        # id сообщения нужен, чтобы кнопка «Забыть» смогла убрать его и из чата Telegram
+        await relay_to_agent(
+            message.bot, user_id, user_text, message.answer, "telegram",
+            user_tg_message_id=message.message_id,
+        )
         return
 
     await add_memory(user_id, user_text)
 
-    await message.answer("🧠 Думаю...")
+    thinking = await message.answer("🧠 Думаю...")
     answer = await get_ai_response(user_id, user_text)
-    await message.answer(answer)
+    sent = await message.answer(answer)
 
-    # Сохраняем обмен репликами, чтобы следующий ответ учитывал контекст
-    await add_chat_message(user_id, "user", user_text)
-    await add_chat_message(user_id, "assistant", answer)
+    # Временное «Думаю...» больше не нужно — убираем, чтобы в чате не оставалось мусора
+    try:
+        await thinking.delete()
+    except Exception:
+        pass
+
+    # Сохраняем обмен репликами (с id сообщений Telegram), чтобы следующий ответ
+    # учитывал контекст, а кнопка «Забыть» могла удалить обе реплики
+    user_row_id = await add_chat_message(user_id, "user", user_text, message.message_id)
+    assistant_row_id = await add_chat_message(user_id, "assistant", answer, sent.message_id)
+    try:
+        await sent.edit_reply_markup(
+            reply_markup=build_forget_keyboard(user_row_id, assistant_row_id)
+        )
+    except Exception as e:
+        print(f"⚠️ Не удалось добавить кнопку «Забыть»: {e}")
 
 
 # ----- Обработка напоминаний -----
