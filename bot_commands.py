@@ -25,6 +25,7 @@ BASE_COMMANDS = DEFAULT_COMMANDS + [
     BotCommand(command="dashboard", description="Дашборд задач To-Do"),
     BotCommand(command="memory", description="Последние записи в памяти"),
     BotCommand(command="digest", description="Дайджест памяти за сутки"),
+    BotCommand(command="clear", description="Стереть историю диалога"),
     BotCommand(command="reminders", description="Список напоминаний"),
     BotCommand(command="timezone", description="Настроить часовой пояс"),
     BotCommand(command="eva_request", description="Запросить доступ к Еве"),
