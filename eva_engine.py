@@ -18,7 +18,7 @@ import re
 from typing import Awaitable, Callable, Optional
 
 from aiogram import Bot
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 
 from ai_core import interpret_eva_command, ask_web, CHAT_HISTORY_LIMIT, CHAT_MESSAGE_MAX_CHARS
 from db import add_eva_command, add_chat_message, get_recent_chat_messages
@@ -43,6 +43,18 @@ def is_agent_online(user_id: int) -> bool:
     return get_user_agent(user_id) is not None
 
 
+def build_forget_keyboard(user_row_id: int, assistant_row_id: int) -> InlineKeyboardMarkup:
+    """Кнопка «🗑 Забыть» под ответом Евы.
+    Формат callback_data: forget:<id реплики пользователя или 0>:<id ответа Евы>
+    (обработчик — handle_forget в handlers.py)."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="🗑 Забыть",
+            callback_data=f"forget:{user_row_id or 0}:{assistant_row_id}",
+        ),
+    ]])
+
+
 async def _load_history_for_agent(user_id: int) -> list[dict]:
     """История диалога для локального мозга: последние реплики из базы сервера."""
     try:
@@ -53,19 +65,32 @@ async def _load_history_for_agent(user_id: int) -> list[dict]:
     return [{"role": r["role"], "text": r["text"][:CHAT_MESSAGE_MAX_CHARS]} for r in rows]
 
 
-async def _save_chat_message(user_id: int, role: str, text: str) -> None:
-    """Сохраняет реплику в историю. Сбой записи не должен ломать ответ пользователю."""
+async def _save_chat_message(
+    user_id: int, role: str, text: str, tg_message_id: Optional[int] = None
+) -> Optional[int]:
+    """Сохраняет реплику в историю и возвращает её id (None — не сохранилась).
+    Сбой записи не должен ломать ответ пользователю."""
     if not text or not text.strip():
-        return
+        return None
     try:
-        await add_chat_message(user_id, role, text)
+        return await add_chat_message(user_id, role, text, tg_message_id)
     except Exception as e:
         print(f"⚠️ Не удалось сохранить реплику в историю: {e}", flush=True)
+        return None
 
 
-async def relay_to_agent(bot: Bot, user_id: int, text: str, reply: ReplyFunc, source: str) -> None:
+async def relay_to_agent(
+    bot: Bot,
+    user_id: int,
+    text: str,
+    reply: ReplyFunc,
+    source: str,
+    user_tg_message_id: Optional[int] = None,
+) -> None:
     """Онлайн-путь: сырой текст + память + история диалога уходят агенту как 'chat'.
-    Мозг (локальная модель) отвечает сам; это не разбор на сервере."""
+    Мозг (локальная модель) отвечает сам; это не разбор на сервере.
+    user_tg_message_id — id сообщения пользователя в Telegram (если оно оттуда),
+    нужен для кнопки «Забыть»."""
     origin = _ORIGIN_VOICE if source == "voice" else _ORIGIN_TELEGRAM
     message_id = new_message_id()
     register_message(message_id, user_id, origin, text)
@@ -82,7 +107,11 @@ async def relay_to_agent(bot: Bot, user_id: int, text: str, reply: ReplyFunc, so
         "history": history,
     }
     # Вопрос сохраняем до отправки, чтобы порядок реплик в истории был верным
-    await _save_chat_message(user_id, "user", text)
+    user_row_id = await _save_chat_message(user_id, "user", text, user_tg_message_id)
+    # Запоминаем id строки: когда придёт ответ, кнопка «Забыть» удалит обе реплики
+    meta = chat_state.get_message(message_id)
+    if meta is not None:
+        meta["user_row_id"] = user_row_id
     sent = await send_to_user_agent(user_id, payload)
     if not sent:
         await reply("📥 Агент сейчас не на связи — попробуй позже.")
@@ -261,19 +290,22 @@ async def process_eva_command(
 # Обратная доставка от агента — chat_result / confirm_request / cloud_action
 # ---------------------------------------------------------------------------
 
-async def _deliver_text(bot: Bot, user_id: int, text: str, image_base64: Optional[str] = None) -> None:
+async def _deliver_text(
+    bot: Bot, user_id: int, text: str, image_base64: Optional[str] = None
+) -> Optional[Message]:
     """Отправляет итог чата пользователю в Telegram (единая точка для
-    chat_result) — для голоса дополнительно озвучиваем через агента."""
+    chat_result). Возвращает отправленное сообщение (нужен его id для кнопки
+    «Забыть») или None, если отправка не удалась."""
     from aiogram.types import BufferedInputFile
     try:
         if image_base64:
             import base64
             photo = BufferedInputFile(base64.b64decode(image_base64), filename="screenshot.png")
-            await bot.send_photo(user_id, photo=photo, caption=text or "Ева")
-        else:
-            await bot.send_message(user_id, text or "Ева")
+            return await bot.send_photo(user_id, photo=photo, caption=text or "Ева")
+        return await bot.send_message(user_id, text or "Ева")
     except Exception as e:
         print(f"⚠️ Не удалось доставить chat_result пользователю {user_id}: {e}", flush=True)
+        return None
 
 
 async def handle_chat_result(bot: Bot, data: dict) -> None:
@@ -281,17 +313,32 @@ async def handle_chat_result(bot: Bot, data: dict) -> None:
     meta = chat_state.get_message(message_id) if message_id else None
     if meta is None:
         return
+    user_id = meta["user_id"]
     kind = data.get("kind", "answer")
-    text = str(data.get("text") or "")
-    # Ответ Евы сохраняем в историю (ошибки — нет, это шум для модели)
+    raw_text = str(data.get("text") or "")
+    shown_text = f"⚠️ {raw_text}" if kind == "error" else raw_text
+
+    sent = await _deliver_text(bot, user_id, shown_text, data.get("image_base64"))
+
+    # Ответ Евы сохраняем в историю (ошибки — нет, это шум для модели).
+    # Вместе с id сообщения в Telegram: по нему «Забыть» удалит и сообщение из чата.
     if kind != "error":
-        await _save_chat_message(meta["user_id"], "assistant", text)
-    if kind == "error":
-        text = f"⚠️ {text}"
-    await _deliver_text(bot, meta["user_id"], text, data.get("image_base64"))
+        assistant_row_id = await _save_chat_message(
+            user_id, "assistant", raw_text, sent.message_id if sent else None
+        )
+        if sent is not None and assistant_row_id is not None:
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=user_id,
+                    message_id=sent.message_id,
+                    reply_markup=build_forget_keyboard(meta.get("user_row_id") or 0, assistant_row_id),
+                )
+            except Exception as e:
+                print(f"⚠️ Не удалось добавить кнопку «Забыть»: {e}", flush=True)
+
     # голос: если пришло голосом — озвучиваем на ПК
     if meta.get("origin") == "voice":
-        await speak_to_owner(meta["user_id"], text)
+        await speak_to_owner(user_id, shown_text)
 
 
 async def handle_confirm_request(bot: Bot, agent_id: str, data: dict) -> None:
