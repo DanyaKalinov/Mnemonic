@@ -15,6 +15,7 @@
 """
 import json
 import re
+from datetime import datetime, timezone
 from typing import Awaitable, Callable, Optional
 
 from aiogram import Bot
@@ -73,10 +74,21 @@ async def _save_chat_message(
     if not text or not text.strip():
         return None
     try:
-        return await add_chat_message(user_id, role, text, tg_message_id)
+        row_id = await add_chat_message(user_id, role, text, tg_message_id)
     except Exception as e:
         print(f"⚠️ Не удалось сохранить реплику в историю: {e}", flush=True)
         return None
+    # Окно приложения показывает диалог вживую: отправляем ему новую реплику вместе с id
+    # (кнопка удаления в окне работает по этому id). Если агент не подключён —
+    # send_to_user_agent просто вернёт False.
+    await send_to_user_agent(user_id, {
+        "type": "chat_message",
+        "id": row_id,
+        "role": role,
+        "text": text,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return row_id
 
 
 async def relay_to_agent(
