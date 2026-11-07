@@ -56,8 +56,9 @@ def build_forget_keyboard(user_row_id: int, assistant_row_id: int) -> InlineKeyb
     ]])
 
 
-async def _load_history_for_agent(user_id: int) -> list[dict]:
-    """История диалога для локального мозга: последние реплики из базы сервера."""
+async def load_history_for_agent(user_id: int) -> list[dict]:
+    """История диалога для локального мозга: последние реплики из базы сервера.
+    Публичная функция: используется и в eva_ws.py."""
     try:
         rows = await get_recent_chat_messages(user_id, limit=CHAT_HISTORY_LIMIT)
     except Exception as e:
@@ -66,11 +67,12 @@ async def _load_history_for_agent(user_id: int) -> list[dict]:
     return [{"role": r["role"], "text": r["text"][:CHAT_MESSAGE_MAX_CHARS]} for r in rows]
 
 
-async def _save_chat_message(
+async def save_chat_message(
     user_id: int, role: str, text: str, tg_message_id: Optional[int] = None
 ) -> Optional[int]:
     """Сохраняет реплику в историю и возвращает её id (None — не сохранилась).
-    Сбой записи не должен ломать ответ пользователю."""
+    Сбой записи не должен ломать ответ пользователю.
+    Публичная функция: используется и в eva_ws.py."""
     if not text or not text.strip():
         return None
     try:
@@ -109,7 +111,7 @@ async def relay_to_agent(
 
     memories = await search_memory(user_id, text, k=TOP_MEMORY_K)
     # История берётся ДО сохранения текущей реплики, иначе вопрос попадёт в неё дважды
-    history = await _load_history_for_agent(user_id)
+    history = await load_history_for_agent(user_id)
     payload = {
         "type": "chat",
         "message_id": message_id,
@@ -119,7 +121,7 @@ async def relay_to_agent(
         "history": history,
     }
     # Вопрос сохраняем до отправки, чтобы порядок реплик в истории был верным
-    user_row_id = await _save_chat_message(user_id, "user", text, user_tg_message_id)
+    user_row_id = await save_chat_message(user_id, "user", text, user_tg_message_id)
     # Запоминаем id строки: когда придёт ответ, кнопка «Забыть» удалит обе реплики
     meta = chat_state.get_message(message_id)
     if meta is not None:
@@ -217,6 +219,7 @@ async def process_eva_command(
     steps = []
     descriptions = []
     any_confirmation_needed = False
+    answered_web = False  # ответ уже дан через ask_web — второй раз через Gemini не отвечаем
 
     prev_action = None
     prev_query = None
@@ -237,6 +240,10 @@ async def process_eva_command(
             # интернет — отвечаем сразу текстом, без похода на ПК.
             answer = await ask_web(params.get("query", step_text))
             await reply(f"🌐 {answer}")
+            # Обмен репликами сохраняем в историю (без префикса «🌐»)
+            await save_chat_message(user_id, "user", step_text)
+            await save_chat_message(user_id, "assistant", answer)
+            answered_web = True
             continue
 
         steps.append({"action": action, "params": params})
@@ -247,10 +254,17 @@ async def process_eva_command(
             prev_query = params.get("query")
 
     if not steps:
+        # Все шаги были ask_web — ответ уже отправлен и сохранён выше
+        if answered_web:
+            return
         # Не действие, а обычный вопрос — при офлайн агенте отвечает Gemini.
         from ai_core import get_ai_response
         answer = await get_ai_response(user_id, command_text)
         await reply(answer)
+        # Сохраняем ПОСЛЕ ответа: get_ai_response сам добавляет вопрос
+        # к истории, иначе он попал бы в контекст дважды
+        await save_chat_message(user_id, "user", command_text)
+        await save_chat_message(user_id, "assistant", answer)
         return
 
     payload: dict = {"steps": steps} if len(steps) > 1 else dict(steps[0])
@@ -335,7 +349,7 @@ async def handle_chat_result(bot: Bot, data: dict) -> None:
     # Ответ Евы сохраняем в историю (ошибки — нет, это шум для модели).
     # Вместе с id сообщения в Telegram: по нему «Забыть» удалит и сообщение из чата.
     if kind != "error":
-        assistant_row_id = await _save_chat_message(
+        assistant_row_id = await save_chat_message(
             user_id, "assistant", raw_text, sent.message_id if sent else None
         )
         if sent is not None and assistant_row_id is not None:
