@@ -7,7 +7,8 @@ from datetime import datetime, timezone, time
 from typing import Optional
 from zoneinfo import ZoneInfo
 from aiogram import Router, F, types, Bot
-from aiogram.filters import Command
+from aiogram.dispatcher.event.bases import SkipHandler
+from aiogram.filters import Command, StateFilter
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
@@ -39,7 +40,7 @@ from task_reminder_parser import (
 from memory import add_memory
 from ai_core import get_ai_response, describe_image, transcribe_voice, summarize_for_digest
 from eva_agent_registry import is_agent_connected, push_command_to_agents, send_to_user_agent
-from eva_engine import process_eva_command, build_forget_keyboard
+from eva_engine import process_eva_command, build_forget_keyboard, is_error_reply
 from bot_commands import sync_commands_for_user
 
 load_dotenv()
@@ -54,6 +55,22 @@ class TaskCreationStates(StatesGroup):
 # ----- FSM Состояние для настройки напоминаний о задачах -----
 class TaskReminderStates(StatesGroup):
     waiting_for_schedule = State()
+
+# ----- Выход из состояний FSM по команде -----
+# Должен стоять ПЕРВЫМ среди хендлеров сообщений: иначе /help, /eva и др. внутри состояния
+# были бы приняты за текст задачи или расписание. Состояние сбрасываем и отдаём команду
+# дальше (SkipHandler), чтобы её обработал свой обычный хендлер.
+@router.message(
+    StateFilter(
+        TaskCreationStates.waiting_for_task_text,
+        TaskReminderStates.waiting_for_schedule,
+    ),
+    F.text.startswith("/"),
+)
+async def reset_state_on_command(message: Message, state: FSMContext):
+    await state.clear()
+    raise SkipHandler()
+
 
 # ----- Состояние ожидания ввода для Dashboard Евы -----
 _pending_dashboard_input: dict[int, str] = {}
@@ -427,7 +444,9 @@ async def start_task_creation(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.message(TaskCreationStates.waiting_for_task_text)
+# Команды (/...) этот хендлер не принимает: их обрабатывает reset_state_on_command и свои хендлеры.
+# Нужно, потому что после SkipHandler aiogram проверяет следующие хендлеры по СТАРОМУ состоянию
+@router.message(TaskCreationStates.waiting_for_task_text, ~F.text.startswith("/"))
 async def handle_task_input(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     user_id = message.from_user.id
@@ -454,7 +473,7 @@ async def handle_task_input(message: Message, state: FSMContext):
 
 # ----- Обработка состояния настройки напоминаний о задачах -----
 
-@router.message(TaskReminderStates.waiting_for_schedule)
+@router.message(TaskReminderStates.waiting_for_schedule, ~F.text.startswith("/"))
 async def handle_task_reminder_schedule(message: Message, state: FSMContext, bot: Optional[Bot] = None):
     """
     Разбирает фразу про расписание и сохраняет настройку.
@@ -1215,6 +1234,11 @@ async def handle_text(message: Message, state: FSMContext):
         await thinking.delete()
     except Exception:
         pass
+
+    # Ответ-ошибка («😵 Извини, я завис») в историю не пишем: Gemini увидел бы его
+    # как свой прошлый ответ. Кнопка «Забыть» тоже не нужна: удалять нечего
+    if is_error_reply(answer):
+        return
 
     # Сохраняем обмен репликами (с id сообщений Telegram), чтобы следующий ответ
     # учитывал контекст, а кнопка «Забыть» могла удалить обе реплики
