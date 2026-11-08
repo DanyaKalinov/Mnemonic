@@ -38,6 +38,17 @@ _ORIGIN_APP = "app"
 
 TOP_MEMORY_K = 5
 
+# Ответы-заглушки get_ai_response / ask_web при сбое начинаются с этих маркеров
+# (то же соглашение, что и в handle_voice в handlers.py)
+_ERROR_REPLY_PREFIXES = ("⚠️", "😵")
+
+
+def is_error_reply(text: Optional[str]) -> bool:
+    """True, если текст — сообщение об ошибке, а не настоящий ответ модели.
+    Такие реплики нельзя писать в историю: Gemini увидит «Извини, я завис»
+    как свой прошлый ответ и начнёт на него опираться."""
+    return not text or text.lstrip().startswith(_ERROR_REPLY_PREFIXES)
+
 
 def is_agent_online(user_id: int) -> bool:
     """Есть ли у этого пользователя подключённый desktop-агент."""
@@ -240,9 +251,10 @@ async def process_eva_command(
             # интернет — отвечаем сразу текстом, без похода на ПК.
             answer = await ask_web(params.get("query", step_text))
             await reply(f"🌐 {answer}")
-            # Обмен репликами сохраняем в историю (без префикса «🌐»)
-            await save_chat_message(user_id, "user", step_text)
-            await save_chat_message(user_id, "assistant", answer)
+            # Обмен репликами сохраняем в историю (без префикса «🌐»), ошибки — нет
+            if not is_error_reply(answer):
+                await save_chat_message(user_id, "user", step_text)
+                await save_chat_message(user_id, "assistant", answer)
             answered_web = True
             continue
 
@@ -263,8 +275,10 @@ async def process_eva_command(
         await reply(answer)
         # Сохраняем ПОСЛЕ ответа: get_ai_response сам добавляет вопрос
         # к истории, иначе он попал бы в контекст дважды
-        await save_chat_message(user_id, "user", command_text)
-        await save_chat_message(user_id, "assistant", answer)
+        # Сообщения об ошибке в историю не пишем
+        if not is_error_reply(answer):
+            await save_chat_message(user_id, "user", command_text)
+            await save_chat_message(user_id, "assistant", answer)
         return
 
     payload: dict = {"steps": steps} if len(steps) > 1 else dict(steps[0])
