@@ -3,7 +3,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aiogram.exceptions import SkipHandler
+from aiogram.dispatcher.event.bases import SkipHandler
 
 import handlers
 
@@ -56,3 +56,55 @@ def test_нормальный_ответ_сохраняется_с_кнопко�
 
     assert add_chat.await_count == 2  # вопрос и ответ
     sent.edit_reply_markup.assert_awaited_once()
+
+
+def test_роутер_команда_в_состоянии_доходит_до_своего_хендлера_и_сбрасывает_состояние(monkeypatch):
+    """Сквозная проверка через настоящий Dispatcher: /help в состоянии создания задачи
+    должен вызвать cmd_help (а не стать текстом задачи), состояние должно сброситься."""
+    from datetime import datetime
+    from aiogram import Dispatcher, Bot
+    from aiogram.fsm.storage.base import StorageKey
+    from aiogram.fsm.storage.memory import MemoryStorage
+    from aiogram.types import Update, Message, Chat, User
+
+    called = {"help": 0, "task": 0}
+
+    async def fake_help(message):
+        called["help"] += 1
+
+    async def fake_add_single_task(**kwargs):
+        called["task"] += 1
+
+    # cmd_help уже зарегистрирован в роутере с оригинальной функцией, поэтому подменяем
+    # зависимости, которые она использует: перехватываем message.answer
+    async def run():
+        storage = MemoryStorage()
+        dp = Dispatcher(storage=storage)
+        dp.include_router(handlers.router)
+        bot = Bot("123:abc")
+
+        sent = []
+
+        async def fake_answer(self, text, **kw):
+            sent.append(text)
+
+        monkeypatch.setattr(Message, "answer", fake_answer)
+        monkeypatch.setattr(handlers, "add_single_task", fake_add_single_task)
+        monkeypatch.setattr(handlers, "is_owner", AsyncMock(return_value=False))
+        monkeypatch.setattr(handlers, "can_use_eva", AsyncMock(return_value=False))
+
+        key = StorageKey(bot_id=123, chat_id=1, user_id=1)
+        await storage.set_state(key, handlers.TaskCreationStates.waiting_for_task_text)
+
+        msg = Message(
+            message_id=1, date=datetime.now(), chat=Chat(id=1, type="private"),
+            from_user=User(id=1, is_bot=False, first_name="t"), text="/help",
+            entities=[{"type": "bot_command", "offset": 0, "length": 5}],
+        )
+        await dp.feed_update(bot, Update(update_id=1, message=msg))
+        return await storage.get_state(key), sent
+
+    state_after, sent = asyncio.run(run())
+    assert state_after is None            # состояние сброшено
+    assert called["task"] == 0            # команда не стала задачей
+    assert any("Что я умею" in s for s in sent)  # пришла справка
